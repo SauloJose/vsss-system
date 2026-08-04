@@ -445,12 +445,13 @@ class settingsMenu(Frame):
 
     def open_color_pick_window(self, item):
         self._hasChild = True
-        self.mode = self.tree.item('I006','value')[0]
-        self.imgPath = self.tree.item('I004','value')[0]
-        self.camPath = self.tree.item('I003','value')[0]
+        self.mode = self.tree.item('I006', 'value')[0]
+        self.imgPath = self.tree.item('I004', 'value')[0]
+        self.camPath = self.tree.item('I003', 'value')[0]
+        self.videoPath = self.tree.item('I005', 'value')[0]
 
         win = Toplevel(self.tree)
-        win.title("Seleção de cores")
+        win.title("Seleção de Cores")
         self.root = win
         win.resizable(False, False)
 
@@ -460,13 +461,22 @@ class settingsMenu(Frame):
         except:
             print("[APP]: Problemas em acessar o ícone")
 
-        # captura de vídeo (se necessário)
+        # captura de mídia (se necessário)
         self.cap = None
+        self.first_frame = None
+
         if self.mode == "camera":
             try:
                 self.cap = cv2.VideoCapture(int(self.camPath))
             except:
                 self.cap = cv2.VideoCapture(0)
+
+        elif self.mode == "video":
+            cap_temp = cv2.VideoCapture(self.videoPath)
+            ret, frame_temp = cap_temp.read()
+            if ret:
+                self.first_frame = frame_temp
+            cap_temp.release()
 
         def close_window():
             if self.cap: self.cap.release()
@@ -475,103 +485,142 @@ class settingsMenu(Frame):
             self._hasChild = False
         win.protocol("WM_DELETE_WINDOW", close_window)
 
-        # converte BGR para hex para Label
+        # --- ESTRUTURA DE LAYOUT (ESQUERDA / DIREITA) ---
+        main_container = Frame(win)
+        main_container.pack(padx=15, pady=15)
+
+        left_frame = Frame(main_container)
+        left_frame.pack(side=LEFT, padx=(0, 15), fill=Y)
+
+        right_frame = Frame(main_container)
+        right_frame.pack(side=RIGHT)
+
+        # --- DIMENSÕES DAS IMAGENS ---
+        img_w, img_h = 600, 350  # Imagem ampliada
+
+        # --- FUNÇÕES DE SUPORTE E CONTROLE ---
         def rgb_to_hex(rgb):
             return f'#{rgb[2]:02X}{rgb[1]:02X}{rgb[0]:02X}'
 
-        # lê HSV dos sliders
         def get_color_from_sliders():
             return np.array([hue_scale.get(), saturation_scale.get(), value_scale.get()], dtype=np.uint8)
 
-        # atualiza Label de cor
         def update_color(val=None):
             hsv = get_color_from_sliders()
-            bgr = cv2.cvtColor(np.uint8([[hsv]]), cv2.COLOR_HSV2BGR)[0,0]
+            bgr = cv2.cvtColor(np.uint8([[hsv]]), cv2.COLOR_HSV2BGR)[0, 0]
             color_display.configure(bg=rgb_to_hex(bgr))
 
-        # salvar cor selecionada
         def pick_color():
             hsv = get_color_from_sliders()
-            self.tree.set(item,'Valor', hsv)
+            self.tree.set(item, 'Valor', hsv)
             self.nodes[item] = hsv
             close_window()
 
-        # função para converter string para array
         def string_to_int_array(array):
             values = array.strip("[]").split()
             return list(map(int, values))
 
-        # botões
-        Button(win, text="Voltar", command=close_window).pack(pady=10)
-        Button(win, text="Selecionar cor", command=pick_color).pack()
+        # --- CONTEÚDO DO PAINEL ESQUERDO (CONTROLES) ---
+        Label(left_frame, text="Cor Selecionada", font=("Arial", 10, "bold")).pack(pady=(0, 5))
+        color_display = Label(left_frame, text="", width=15, height=2, bg="gray", relief="ridge")
+        color_display.pack(pady=(0, 15))
 
-        # sliders
-        current_hsv = string_to_int_array(self.tree.item(item,'value')[0])
-        hue_scale = Scale(win, from_=0, to=179, orient="horizontal", label="Matiz (H)", length=300, command=update_color)
-        hue_scale.set(current_hsv[0]); hue_scale.pack()
-        saturation_scale = Scale(win, from_=0, to=255, orient="horizontal", label="Saturação (S)", length=300, command=update_color)
-        saturation_scale.set(current_hsv[1]); saturation_scale.pack()
-        value_scale = Scale(win, from_=0, to=255, orient="horizontal", label="Valor (V)", length=300, command=update_color)
-        value_scale.set(current_hsv[2]); value_scale.pack()
+        current_hsv = string_to_int_array(self.tree.item(item, 'value')[0])
 
-        color_display = Label(win, text="Cor Definida", width=10, height=2, bg="gray")
-        color_display.pack()
+        hue_scale = Scale(left_frame, from_=0, to=179, orient="horizontal", label="Matiz (H)", length=250, command=update_color)
+        hue_scale.set(current_hsv[0]); hue_scale.pack(pady=5)
 
-        # labels para imagens
-        original_label = Label(win, text="Imagem Original"); original_label.pack()
-        masked_label = Label(win, text="Imagem Filtrada"); masked_label.pack()
+        saturation_scale = Scale(left_frame, from_=0, to=255, orient="horizontal", label="Saturação (S)", length=250, command=update_color)
+        saturation_scale.set(current_hsv[1]); saturation_scale.pack(pady=5)
 
-        # tolerâncias
-        hue_tol = 6 if self.tree.item(item,'text')=='Cor da bola' else 10
+        value_scale = Scale(left_frame, from_=0, to=255, orient="horizontal", label="Valor (V)", length=250, command=update_color)
+        value_scale.set(current_hsv[2]); value_scale.pack(pady=5)
+
+        # Botões de Ação na Esquerda
+        btn_frame = Frame(left_frame)
+        btn_frame.pack(pady=(20, 0))
+        Button(btn_frame, text="Selecionar Cor", command=pick_color, bg="#4CAF50", fg="white", font=("Arial", 9, "bold")).pack(fill=X, pady=2)
+        Button(btn_frame, text="Voltar", command=close_window).pack(fill=X, pady=2)
+
+        # --- CONTEÚDO DO PAINEL DIREITO (IMAGENS) ---
+        Label(right_frame, text="Clique na imagem para capturar a cor", font=("Arial", 9, "italic")).pack()
+
+        original_label = Label(right_frame, text="Imagem Original", cursor="crosshair")
+        original_label.pack(pady=(5, 10))
+
+        masked_label = Label(right_frame, text="Imagem Filtrada")
+        masked_label.pack(pady=5)
+
+        # Tolerâncias do filtro
+        hue_tol = 6 if self.tree.item(item, 'text') == 'Cor da bola' else 10
         sat_tol, val_tol = 50, 50
-        img_w, img_h = 300, 150
 
-        # clique para escolher cor
+        # --- CLIQUE NA IMAGEM (CONTA-GOTAS) ---
         def on_click(event):
-            if hasattr(capture_frame, 'last_frame'):
-                frame_hsv = cv2.cvtColor(capture_frame.last_frame, cv2.COLOR_BGR2HSV)
-                # converte coordenadas do click para coordenadas da imagem original
-                x = int(event.x * capture_frame.last_frame.shape[1] / img_w)
-                y = int(event.y * capture_frame.last_frame.shape[0] / img_h)
+            if hasattr(capture_frame, 'last_frame') and capture_frame.last_frame is not None:
+                # Limita as coordenadas ao tamanho da imagem renderizada
+                x = min(max(0, event.x), img_w - 1)
+                y = min(max(0, event.y), img_h - 1)
 
-                # define limites do vizinho 3x3
-                x1, y1 = max(0, x-1), max(0, y-1)
-                x2, y2 = min(frame_hsv.shape[1]-1, x+1), min(frame_hsv.shape[0]-1, y+1)
+                # Pega o pixel BGR (NumPy usa formato [linha/y, coluna/x])
+                bgr_pixel = np.uint8([[capture_frame.last_frame[y, x]]])
 
-                # pega os pixels 3x3 e calcula a média
-                hsv_neighbors = frame_hsv[y1:y2+1, x1:x2+1]
-                mean_hsv = np.mean(hsv_neighbors.reshape(-1,3), axis=0).astype(int)
+                # Converte para HSV
+                hsv_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2HSV)[0, 0]
 
-                # atualiza sliders e display
-                hue_scale.set(mean_hsv[0])
-                saturation_scale.set(mean_hsv[1])
-                value_scale.set(mean_hsv[2])
+                # Atualiza os sliders
+                hue_scale.set(hsv_pixel[0])
+                saturation_scale.set(hsv_pixel[1])
+                value_scale.set(hsv_pixel[2])
+
                 update_color()
 
         original_label.bind("<Button-1>", on_click)
 
-        # função para captura (imagem ou vídeo)
+        # --- LOOP DE CAPTURA E EXIBIÇÃO ---
         def capture_frame():
-            if self.mode=="imagem":
+            frame = None
+
+            if self.mode == "imagem":
                 frame = cv2.imread(self.imgPath)
-            elif self.cap:
+            elif self.mode == "video":
+                if hasattr(self, 'first_frame') and self.first_frame is not None:
+                    frame = self.first_frame.copy()
+            elif self.mode == "camera" and self.cap:
                 ret, frame = self.cap.read()
                 if not ret: return
             else:
                 return
 
+            if frame is None:
+                return
+
+            # Redimensiona para o novo tamanho ampliado
             frame = cv2.resize(frame, (img_w, img_h))
             capture_frame.last_frame = frame.copy()
 
-            # cria máscara
-            h,s,v = get_color_from_sliders()
-            lower = np.array([h-hue_tol, max(0,s-sat_tol), max(0,v-val_tol)])
-            upper = np.array([h+hue_tol, min(255,s+sat_tol), min(255,v+val_tol)])
+            # --- CORREÇÃO DO ERRO DE OVERFLOW / DTYPE ---
+            # Converte valores H, S, V para 'int' do Python antes de somar/subtrair
+            h, s, v = map(int, get_color_from_sliders())
+
+            # Garante tipo np.uint8 e aplica limites válidos de HSV no OpenCV
+            lower = np.array([
+                max(0, h - hue_tol),
+                max(0, s - sat_tol),
+                max(0, v - val_tol)
+            ], dtype=np.uint8)
+
+            upper = np.array([
+                min(179, h + hue_tol),  # No OpenCV o Hue vai até 179
+                min(255, s + sat_tol),
+                min(255, v + val_tol)
+            ], dtype=np.uint8)
+
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, lower, upper)
             masked = cv2.bitwise_and(frame, frame, mask=mask)
 
-            # atualiza Labels
+            # Atualiza os quadros Tkinter
             for img, lbl in [(frame, original_label), (masked, masked_label)]:
                 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 lbl.img = ImageTk.PhotoImage(Image.fromarray(img_rgb))
@@ -580,8 +629,6 @@ class settingsMenu(Frame):
             win.after(10, capture_frame)
 
         capture_frame()
-
-            #self.root.mainloop()
 
     #Adquirindo os dados com o get_tree_data, é uma função recursiva
     def get_tree_data(self, node_id=''):

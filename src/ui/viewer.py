@@ -120,7 +120,7 @@ class WindowsViewer:
     def show(self, image):
         tamanho = len(image)
 
-        pathImg = 'src/images/dark_screen.png'
+        pathImg = 'src/data/images/dark_screen.png'
         imgagemPadrao = cv2.imread(pathImg)
         cv2Img = cv2.cvtColor(imgagemPadrao, cv2.COLOR_BGR2RGBA)
         pilImage = Image.fromarray(cv2Img)

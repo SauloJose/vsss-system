@@ -6,8 +6,14 @@ import importlib
 import os
 import threading
 import platform
+import argparse
+import argparse
 
 # Pacotes e módulos correspondentes
+REQUIREMENTS_FILE = "src/data/requirements.txt"
+
+INSTALATOR_SCRIPT = "install.py"
+
 PACKAGE_MODULE_MAP = {
     "annotated-types": "annotated_types",
     "anyio": "anyio",
@@ -286,6 +292,61 @@ class InstallerApp(tk.Tk):
             self.log("❌ Arquivo main.py não encontrado!")
             messagebox.showerror("Erro", "main.py não encontrado no diretório do projeto!")
 
-if __name__ == "__main__":
+def install_requirements(venv_python=None, quiet=False):
+    req_file = os.path.join(os.path.dirname(__file__), REQUIREMENTS_FILE)
+    if not os.path.exists(req_file):
+        raise FileNotFoundError(f"Arquivo de requirements não encontrado: {req_file}")
+
+    python_exe = venv_python or sys.executable
+    critical_packages = [
+        "numpy",
+        "opencv-python",
+        "Pillow",
+        "pyserial",
+        "protobuf==3.20.3",
+        "paho-mqtt",
+        "ttkthemes",
+        "Unidecode",
+        "pytube",
+        "yt-dlp",
+        "pydantic",
+        "pydantic_core",
+        "typing_extensions",
+    ]
+
+    for pkg in critical_packages:
+        subprocess.run([python_exe, "-m", "pip", "install", pkg], capture_output=True, text=True, check=False)
+
+    cmd = [python_exe, "-m", "pip", "install", "-r", req_file]
+    if quiet:
+        cmd.append("-q")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if "lazy-object-proxy" in result.stderr or "lazy-object-proxy" in result.stdout:
+            print("[INSTALL] Ignorando falha de lazy-object-proxy; dependências críticas já foram abordadas.")
+            return result
+        raise RuntimeError(result.stderr or result.stdout)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Instalador VSSS")
+    parser.add_argument('--venv', action='store_true', help='Use o ambiente virtual .venv do projeto')
+    parser.add_argument('--quiet', action='store_true', help='Instala em modo silencioso')
+    args = parser.parse_args()
+
+    if args.venv:
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        venv_python = os.path.join(project_root, '.venv', 'Scripts', 'python.exe')
+        if not os.path.exists(venv_python):
+            raise FileNotFoundError(f"Ambiente virtual não encontrado: {venv_python}")
+        install_requirements(venv_python=venv_python, quiet=args.quiet)
+        return
+
     app = InstallerApp()
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

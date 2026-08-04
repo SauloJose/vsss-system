@@ -1,0 +1,136 @@
+# Created by https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,linux,opencv
+
+### Linux ###
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+### OpenCV ###
+*/CMakeFiles
+*/CMakeCache.txt
+*/Makefile
+*/cmake_install.cmake
+.DS_Store
+
+### Python ###
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django & Flask stuff:
+*.log
+local_settings.py
+db.sqlite3
+instance/
+.webassets-cache
+
+# Jupyter / IPython
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs & Tools
+.spyderproject
+.spyproject
+.ropeproject
+.pdm.toml
+__pypackages__/
+.mypy_cache/
+.ruff_cache/
+pyrightconfig.json
+
+### VisualStudioCode ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+*.vsix
+.ionide
+
+# ==============================================================================
+# Custom / Project Specific Rules (VisionSystem & VSSS)
+# ==============================================================================
+
+# Arquivos sensíveis / Módulos de comunicação privados
+communication_secure.py
+
+# Gravações de teste, vídeos e dumps de telas
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Logs e dados locais de execução
+*.log
+*.csv
+
+# Modelos de IA / Pesos (caso utilize YOLO, TensorRT, etc.)
+*.pt
+*.onnx
+*.weights
+*.engine

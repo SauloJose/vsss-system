@@ -7,7 +7,7 @@ from modules.VisionSys.components.objects import *
 
 class Robot:
     def __init__(self, id: ID_Robots, team: ID_Team, x=0, y=0, r=0,
-                 image=cv2.imread('src/images/dark_screen.png'),
+                 image=cv2.imread('src/data/images/dark_screen.png'),
                  colorTeam=None, colorCar1=None, colorCar2=None,
                  differential_filter=False):
         # Identifiers
@@ -26,7 +26,7 @@ class Robot:
     
         # Geometry
         self.radius = float(r)
-        self.objLimit = Circle(self.radius, Point2D(x, y))
+        self.objLimit = Circle(Point2D(x, y), self.radius)
         self.bbox = BorderBox(GeometryType.CIRCLE, self.objLimit)
         self.ObjType = ObjTypeMove.MOVING
         self.objTypeSystem = ObjTypeVision.ROBOT
@@ -157,7 +157,7 @@ class Robot:
             self.viewRect.setDimension(image.shape[1])
 
         # Geometry
-        self.objLimit = Circle(self.radius, Point2D(x, y))
+        self.objLimit = Circle(Point2D(x, y), self.radius)
         self.viewRect.updateViewBot(Point2D(x, y))
         self.updateBbox()
 
@@ -189,7 +189,7 @@ class Robot:
             self.image = image
             self.viewRect.setDimension(image.shape[1])
 
-        self.objLimit = Circle(self.radius, Point2D(x, y))
+        self.objLimit = Circle(Point2D(x, y), self.radius)
         self.updateBbox()
         self.viewRect.updateViewBot(Point2D(x, y))
 
@@ -306,48 +306,48 @@ class Robot:
         self.kalman_P = (np.eye(6) - K @ H) @ self.kalman_P
 
     # Preciso realizar a conversão desses valores para a coordenada da imagem
-    def get_roi(self, image_shape, t_now, scale_std=3):
-        """
-        Retorna as dimensões do ROI centrado na previsão do Kalman,
-        baseado nas variâncias do Kalman.
+    def get_roi(self, image_shape, t_now, vision_sys, scale_std=3):
+        if not self.kalman_initialized or self.kalman_last_time is None:
+            return 0, 0, image_shape[1], image_shape[0]
 
-        Parâmetros:
-            image_shape : tuple(int, int)
-                (altura, largura) da imagem
-            scale_std : float
-                Multiplicador da raiz quadrada da variância para definir o ROI
-            t_now: timestamp atual para realizar a predição.
-        Retorna:
-            tuple: (x, y, w, h) coordenadas do topo-esquerdo e tamanho do ROI
-        """
-        # --- 1) Posição predita ---
+        # --- 1) Posição predita pelo EKF (Em Centímetros) ---
         st_pred, P_pred = self.predict_with_cov(t_now)
-        x_pred = st_pred[0,0]
-        y_pred = st_pred[1,0]
+        x_pred = st_pred[0, 0]
+        y_pred = st_pred[1, 0]
 
-
-        # --- 2) Calcula desvio padrão das coordenadas x e y ---
-        if self.kalman_initialized:
-            std_x = np.sqrt(P_pred[0, 0])
-            std_y = np.sqrt(P_pred[1, 1])
+        # --- 2) CONVERSÃO CRÍTICA: Centímetros globais -> Pixels Absolutos ---
+        x_img, y_img = vision_sys.getImageRealIndice([x_pred, y_pred])
+        
+        # --- 3) AJUSTE DE RECORTE: Relativo à subimagem fieldReduce ---
+        if vision_sys.viewCapture.cooVetor is not None:
+            x_offset, y_offset = vision_sys.viewCapture.cooVetor[0], vision_sys.viewCapture.cooVetor[1]
+            x_c = x_img - x_offset
+            y_c = y_img - y_offset
         else:
-            std_x = std_y = 20.0  # fallback se Kalman não inicializado
+            x_c, y_c = x_img, y_img
 
-        # --- 3) Define tamanho do ROI ---
-        w_roi = int(scale_std * std_x * 2)  # multiplicado por 2 para pegar ±std
+        # --- 4) FATOR DE ESCALA DINÂMICO: Pixels por Centímetro ---
+        # Baseado no raio atual do robô em pixels (self.ri) vs raio real em cm (self.radius)
+        pixels_per_cm = (self.ri / self.radius) if self.ri > 0 else 5.0
+
+        # --- 5) Desvios padrão convertidos de centímetros para PIXELS ---
+        std_x = np.sqrt(P_pred[0, 0]) * pixels_per_cm
+        std_y = np.sqrt(P_pred[1, 1]) * pixels_per_cm
+
+        # --- 6) Define tamanho do ROI em pixels ---
+        w_roi = int(scale_std * std_x * 2)
         h_roi = int(scale_std * std_y * 2)
 
-        min_dimension = int(2.5*self.radius)
-
-        # Impor valores mínimos para impedir estrangulamento
+        # [CORREÇÃO] Garante tamanho mínimo coerente com o tamanho do robô em pixels na tela
+        min_dimension = int(3.0 * self.ri) if self.ri > 0 else int(2.5 * self.radius * pixels_per_cm)
         w_roi = max(w_roi, min_dimension)
         h_roi = max(h_roi, min_dimension)
 
-        # --- 4) Topo-esquerdo ---
-        x = int(x_pred - w_roi // 2)
-        y = int(y_pred - h_roi // 2)
+        # --- 7) Topo-esquerdo ---
+        x = int(x_c - w_roi // 2)
+        y = int(y_c - h_roi // 2)
 
-        # --- 5) Ajusta limites à imagem ---
+        # --- 8) Ajusta limites à imagem ---
         h_img, w_img = image_shape[:2]
         x = max(0, min(x, w_img - 1))
         y = max(0, min(y, h_img - 1))
@@ -355,8 +355,7 @@ class Robot:
         h_roi = min(h_roi, h_img - y)
 
         return x, y, w_roi, h_roi
-
-    # Recuperar predição do filtro de Kalman
+    
     # Recuperar predição do filtro de Kalman
     def predict(self, time):
         """

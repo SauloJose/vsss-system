@@ -26,7 +26,7 @@ class Card:
         self.canvas = Canvas(self.imageFrame, width=50, height=50)
         self.canvas.pack()
 
-        self.image_path = "src/images/dark_screen.png"
+        self.image_path = "src/data/images/dark_screen.png"
         self.load_image()
 
     def load_image(self):

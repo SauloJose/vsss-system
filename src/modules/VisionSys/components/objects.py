@@ -795,19 +795,19 @@ class Capture:
         self.videoPath = None
         self.CAM = None
 
-        # --- VARIÁVEIS DE THREAD (Essenciais para corrigir o erro) ---
+        # --- VARIÁVEIS DE THREAD ---
         self.latest_frame = None
         self.lock = threading.Lock()
         self.running = False
         self.thread = None
-        # -------------------------------------------------------------
+        # ---------------------------
 
         self.GPUMode(self._hasGPU)
 
     def setMode(self, mode: CaptureMode):
         self.mode = mode
 
-    def setModeFocus(self, mode:FocusMode = FocusMode.AUTO):
+    def setModeFocus(self, mode: FocusMode = FocusMode.AUTO):
         if self.mode == CaptureMode.CAM and (self.CAM is not None):
             if mode == FocusMode.AUTO:
                 if not self.CAM.set(cv2.CAP_PROP_AUTOFOCUS, 0):
@@ -835,31 +835,30 @@ class Capture:
             self.modeCam = FocusMode.AUTO
             return False
 
-    def setFocusManual(self, value:float):
+    def setFocusManual(self, value: float):
         if self.mode == CaptureMode.CAM and self._camHasFocusControl:
             if self.modeCam == FocusMode.MANUAL and (self.CAM is not None):
                 self.focusManual = np.clip(value, 0, 255)
                 self.CAM.set(cv2.CAP_PROP_FOCUS, self.focusManual)
 
-    def GPUMode(self, useGpu:bool):
+    def GPUMode(self, useGpu: bool):
         self._hasGPU = useGpu
-        if(self._hasGPU):
+        if self._hasGPU:
             self.cuda = cv2.cuda.GpuMat()
             if self.cuda is not None:
-                print("[CAPTURA]: Construído com sucesso")
+                print("[CAPTURA]: Construído com GPU / CUDA")
         else:
             self.cuda = None
 
     def setIdCam(self, id):
         self.idCam = int(id)
-        # Se for mudar de câmera, reseta a anterior primeiro
         if self.CAM is not None:
             self.running = False
             if self.thread is not None:
                 self.thread.join(timeout=1.0)
             self.CAM.release()
 
-        if(self.mode == CaptureMode.CAM):
+        if self.mode == CaptureMode.CAM:
             try:
                 self.CAM = cv2.VideoCapture(self.idCam)
                 if not self.CAM.isOpened():
@@ -868,7 +867,6 @@ class Capture:
                     self._hasCamera = True
                     self.CAM.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     
-                    # Inicia Thread
                     self.running = True
                     self.thread = threading.Thread(target=self._update_cam_loop, daemon=True)
                     self.thread.start()
@@ -878,7 +876,7 @@ class Capture:
         return False
 
     def _update_cam_loop(self):
-        """ Thread loop para limpar buffer """
+        """ Thread loop para limpar buffer da câmera """
         while self.running and self.CAM is not None and self.CAM.isOpened():
             ret, frame = self.CAM.read()
             if ret:
@@ -892,43 +890,68 @@ class Capture:
 
     def setVideoPath(self, pathVideo):
         self.videoPath = pathVideo
+        if self.mode == CaptureMode.VIDEO:
+            if self.CAM is not None:
+                self.CAM.release()
+            self.CAM = cv2.VideoCapture(self.videoPath)
+            if not self.CAM.isOpened():
+                print("[Capture] Erro ao abrir vídeo:", self.videoPath)
 
     def getImageNoCuda(self):
-        if(not self._hasGPU):
+        if not self._hasGPU:
             if self.mode == CaptureMode.IMG:
                 if self.imgPath:
                     self.image = cv2.imread(self.imgPath)
                 return self.image
             
             elif self.mode == CaptureMode.CAM:
-                # Leitura Thread-Safe instantânea
                 with self.lock:
                     if self.latest_frame is not None:
                         self.image = self.latest_frame.copy()
                 return self.image
-            else:
+
+            elif self.mode == CaptureMode.VIDEO:
+                if self.CAM is not None and self.CAM.isOpened():
+                    ret, frame = self.CAM.read()
+                    if ret:
+                        self.image = frame
+                        return self.image
+                    else:
+                        self.image = None
+                        return None # Fim do vídeo alcançado
                 return None
         return None
-    
+
     def getImageCuda(self):
-        if(self._hasGPU):
+        if self._hasGPU:
             if self.mode == CaptureMode.IMG:
-                self.image = cv2.imread(self.imgPath)
-                self.cuda.upload(self.image)
-                return self.cuda
+                if self.imgPath:
+                    self.image = cv2.imread(self.imgPath)
+                    if self.image is not None:
+                        self.cuda.upload(self.image)
+                        return self.cuda
+
             elif self.mode == CaptureMode.CAM:
-                # Para CUDA, ainda precisamos pegar o frame da thread e subir
                 with self.lock:
                     if self.latest_frame is not None:
-                        self.image = self.latest_frame # Sem copy para ser rápido antes do upload? 
-                        # Melhor fazer copy se houver risco de tearing, mas upload é rápido.
+                        self.image = self.latest_frame.copy()
                 
                 if self.image is not None:
                     self.cuda.upload(self.image)
                     return self.cuda
-                return None
+
+            elif self.mode == CaptureMode.VIDEO:
+                if self.CAM is not None and self.CAM.isOpened():
+                    ret, frame = self.CAM.read()
+                    if ret:
+                        self.image = frame
+                        self.cuda.upload(self.image)
+                        return self.cuda
+                    else:
+                        self.image = None
+                        return None # Fim do vídeo alcançado
         return None
-    
+
     def getImage(self):
         if self._hasGPU:
             return self.getImageCuda()
@@ -936,17 +959,15 @@ class Capture:
             return self.getImageNoCuda()
 
     def reset(self):
-        # 1. Para Thread
+        # 1. Para Thread de Câmera
         self.running = False
         if hasattr(self, 'thread') and self.thread is not None:
             self.thread.join(timeout=1.0)
             self.thread = None
 
-        # 2. Reseta Variáveis
+        # 2. Reseta Variáveis de Estado
         self.latest_frame = None
-        
-        # ... Seus resets originais ...
-        self.mode = CaptureMode.DEFAULT # Certifique-se que CaptureMode.DEFAULT existe
+        self.mode = CaptureMode.DEFAULT
         self.image = None
         self.isCamRunning = False
         self.idCam = 0 
@@ -956,6 +977,7 @@ class Capture:
         self._hasCamera = False
         self._camHasFocusControl = False
 
+        # 3. Libera Recursos do OpenCV e CUDA
         if self.CAM is not None:
             self.CAM.release()
             self.CAM = None
@@ -965,6 +987,7 @@ class Capture:
 
     def __del__(self):
         self.reset()
+        
 #classe para gerenciar a thread de captura de dados
 class CameraCaptureThread(threading.Thread):
     '''
