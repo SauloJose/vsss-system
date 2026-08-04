@@ -227,8 +227,11 @@ class VisionSystem:
         '''Imagem final já reduzida e processada'''
         self.imgReduce          = None              
         '''Imagem reduzida para utilizar no processamento'''
-        self.binaryAllTeam      = None 
+        self.binaryAllies      = None 
 
+        # Definindo a binária para ser utilizada para guardar os robôs corretos
+        self.binaryAllyConfirmed = None 
+        
         #Imagem virtual que será utilizada para o processamenot
         self.virtual            = cv2.imread("src/data/images/CampoVirtual.png")
         self.virtualImg         = self.virtual.copy()   #As manipulações da imagem serão feitas nessa aqui
@@ -485,7 +488,7 @@ class VisionSystem:
         self.binaryBall = np.zeros((1, 1), dtype=np.uint8)
         self.binReduceField = np.zeros((1, 1), dtype=np.uint8)
         self.binField = np.zeros((1, 1), dtype=np.uint8)
-        self.binaryAllTeam = np.zeros((1, 1), dtype=np.uint8)
+        self.binaryAllies = np.zeros((1, 1), dtype=np.uint8)
         
         # ==================== BUFFERS DE PROCESSAMENTO ====================
         self.playersWindows = [None, None, None, None, None, None]
@@ -640,7 +643,7 @@ class VisionSystem:
 
     #Puxando as imagens de debug
     def GetDebugImages(self):
-        return self.binaryObjects, self.binaryBall, self.binaryPlayers, self.binaryAllTeam 
+        return self.binaryObjects, self.binaryBall, self.binaryPlayers, self.binaryAllies 
         
         
     #Inicializando os objetos do sistema
@@ -1956,7 +1959,7 @@ class VisionSystem:
                             (0, 255, 255), 2)
         else:
             self.ball.status = False
-            
+
     def DetectPlayers(self, img, timestamp, dbg=False, isT=False, hsv_img=None):
         """
         Detecta robôs na imagem. Cada contorno cru da máscara fechada é
@@ -1965,12 +1968,13 @@ class VisionSystem:
         distance transform (funciona para colisão entre times OU dentro do
         mesmo time).
         """
-        # 1. Usa o HSV Global
+        # =========== 1. Preparação Usa o HSV Global ===================
         if hsv_img is not None:
             imgHSV = hsv_img
         else:
             imgHSV = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         debug = dbg
+        
         # Cache de últimas posições conhecidas (persiste entre frames).
         if not hasattr(self, "_enemy_last_pos"):
             self._enemy_last_pos = {}   # {slot_idx (0,1,2): (xcm, ycm)}
@@ -1982,9 +1986,8 @@ class VisionSystem:
             bot.setStatus(False)
         ellipse5 = self.struct_ellipse5
         rect11 = self.struct_rect11
-        # --------------------------------------------------------------------
-        # Máscara genérica -> erosão -> fechamento (igual ao original)
-        # --------------------------------------------------------------------
+
+        # =========== 2. Máscara genérica ===========================
         obj_mask = cv2.inRange(imgHSV, self.objectsDarkColor, self.objectsLightColor)
         if self.ball.status:
             xb, yb = int(self.ball.xb), int(self.ball.yb)
@@ -1993,61 +1996,39 @@ class VisionSystem:
             y1b, y2b = max(0, yb - r), min(h, yb + r)
             x1b, x2b = max(0, xb - r), min(w, xb + r)
             obj_mask[y1b:y2b, x1b:x2b] = 0
+
         closed_mask = cv2.erode(obj_mask, ellipse5, iterations=1)
         closed_mask = cv2.morphologyEx(closed_mask, cv2.MORPH_CLOSE, rect11)
         # Mantido só para compatibilidade com qualquer uso externo de
-        # self.binaryPlayers - "players" (lista de quads) NÃO é mais usada
         # para decidir candidatos.
-        self.binaryPlayers, _unused_square_players = self.DetectSquares(closed_mask)
-        # Pré-cálculos
+        self.binaryPlayers = np.zeros_like(closed_mask)
+        self.binaryAllies = np.zeros_like(closed_mask)
+
+        # =========== 3.Parâmetros ======================
         winSize = int(18 * self.prop_px_cm)
         half_win = winSize // 2
         playerRadius = (7.5 / 2) * np.sqrt(2) * self.prop_px_cm
         mainColorRadius = (7.5 / 4) * np.sqrt(5) * self.prop_px_cm
         player_area_px = np.pi * playerRadius ** 2
         color_area_px = np.pi * mainColorRadius ** 2
-        MAX_JUMP_CM = 25.0          # gating de distância (FIX #5)
-        MIN_COLOR_PIXELS = 8        # ignora ruído mínimo de cor
-        MIN_PEAK_VAL_PX = 0.30 * mainColorRadius  # pico do distance transform mínimo p/ contar como robô real
-        SUPPRESS_RADIUS_PX = max(mainColorRadius, 1.0)  # zona suprimida ao redor de cada pico aceito
+        MAX_JUMP_CM = 50.0          # gating de distância (FIX #5) #Deixei 200 aqui só para debug.
         NOISE_RADIUS_MIN = 0.2 * playerRadius     # abaixo disso, contorno é ruído da máscara, ignora
         # Constantes acima são ponto de partida - calibrar com imagens reais de colisão.
         AgoalFlag = Aatk1Flag = Aatk2Flag = False
-        if debug:
-            binaryAllies = np.zeros(img.shape[:2], dtype=np.uint8)
-            binaryAllTeam = np.zeros(img.shape[:2], dtype=np.uint8)
+
         ally_candidates = []
         enemy_candidates = []
 
-        # ----------------------------------------------------------------------
-        # Helpers internos (fecham sobre img/imgHSV/self via closure)
-        # ----------------------------------------------------------------------
-        def _find_color_peaks(mask, n_expected, suppress_radius_px, min_peak_val):
+        # =========== 4. Helper: Construir candidado a partir de um centro ===========
+        def _build_candidate_from_center(cx, cy, cnt=None):
             """
-            Acha até n_expected centros de massa de cor num mask binário,
-            via distance transform + supressão de vizinhança (NMS greedy).
-            Retorna lista de (x, y, peak_val) em coords LOCAIS ao mask.
+            Versão do _build_single_candidate que não depende do contorno original.
+            Usa (cx, cy) como centro estimado do robô.
             """
-            peaks = []
-            if n_expected <= 0:
-                return peaks
-            dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-            for _ in range(n_expected):
-                _, maxVal, _, maxLoc = cv2.minMaxLoc(dist)
-                if maxVal < min_peak_val:
-                    break  # o que sobrou é ruído, não mais um robô
-                peaks.append((maxLoc[0], maxLoc[1], maxVal))
-                cv2.circle(dist, maxLoc, int(suppress_radius_px), 0, -1)
-            return peaks
-
-        def _build_single_candidate(cnt, cx, cy):
-            """
-            Caminho de 1 robô: procura a maior mancha de cor de time numa
-            janela ao redor do centróide do contorno cru. Não exige nenhuma
-            forma específica do contorno - só o tamanho já filtrou isso.
-            """
-            x1, y1 = max(0, int(cx - half_win)), max(0, int(cy - half_win))
-            x2, y2 = min(img.shape[1], int(cx + half_win)), min(img.shape[0], int(cy + half_win))
+            x1 = max(0, int(cx - half_win))
+            y1 = max(0, int(cy - half_win))
+            x2 = min(img.shape[1], int(cx + half_win))
+            y2 = min(img.shape[0], int(cy + half_win))
             windowActual = img[y1:y2, x1:x2]
             if windowActual.size == 0:
                 return None
@@ -2059,12 +2040,14 @@ class VisionSystem:
             total_area = max(ally_area + enemy_area, 1)
             ally_ratio = ally_area / total_area
             enemy_ratio = enemy_area / total_area
+
             if ally_ratio > 0.4:
                 team_is_enemy = False
             elif enemy_ratio > 0.4:
                 team_is_enemy = True
             else:
-                return None  # time indefinido
+                return None
+
             curr_mask = mask_enemy if team_is_enemy else mask_ally
             contour = max(cv2.findContours(curr_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0],
                         key=cv2.contourArea, default=None)
@@ -2076,119 +2059,172 @@ class VisionSystem:
             min_rc = (0.75 if team_is_enemy else 0.5) * mainColorRadius
             if rc < min_rc:
                 return None
+
             direction = np.array([cx, -cy]) - np.array([x_m, -y_m])
             modDir = np.linalg.norm(direction)
             if modDir > 1e-6:
                 direction = direction / modDir
+
             xcm, ycm = self.GetPointVirtual(self.TransformPoint(np.array([cx, cy])))
+
             return team_is_enemy, {
                 "xi": cx, "yi": cy, "ri": playerRadius,
                 "x_m": x_m, "y_m": y_m,
                 "xcm": xcm, "ycm": ycm, "rcm": 5.30,
                 "direction": direction,
                 "windowActual": windowActual,
-                "contour": cnt,
+                "contour": cnt,  # pode ser None
             }
-
-        def _split_merged_blob(cnt, cx, cy, n_est):
+    
+        # ========= 5. Helper: Separação por erosão iterativa =========
+        def _split_by_erosion(cnt, cx, cy, n_est):
             """
-            Caminho de blob fundido (N robôs colados, mesmo time ou times
-            diferentes - não importa, tratado igual): dentro da região do
-            blob, procura picos de cor de aliado e de inimigo
-            independentemente. Cada pico aceito = 1 candidato.
+            Aplica erosão sucessiva na máscara genérica (apenas a região do blob)
+            até que o número de componentes conectados seja >= n_est.
+            Retorna lista de centros (x, y) em coordenadas globais.
             """
-            out = []
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            margin = int(0.4 * winSize)
-            bx1, by1 = max(0, bx - margin), max(0, by - margin)
-            bx2, by2 = min(img.shape[1], bx + bw + margin), min(img.shape[0], by + bh + margin)
-            hsv_big = imgHSV[by1:by2, bx1:bx2]
-            if hsv_big.size == 0:
-                return out
-            for lower, upper, is_enemy in (
-                (self.ally_lower_bound, self.ally_upper_bound, False),
-                (self.enemy_lower_bound, self.enemy_upper_bound, True),
-            ):
-                team_mask = self.MaskInRange(hsv_big, lower, upper)
-                team_area = cv2.countNonZero(team_mask)
-                if team_area < MIN_COLOR_PIXELS:
-                    continue  # essa cor não tem presença relevante nesse blob
-                n_team_est = max(1, min(n_est, round(team_area / color_area_px)))
-                peaks = _find_color_peaks(team_mask, n_team_est, SUPPRESS_RADIUS_PX, MIN_PEAK_VAL_PX)
-                min_rc = (0.75 if is_enemy else 0.5) * mainColorRadius
-                for lx, ly, peak_val in peaks:
-                    if peak_val < min_rc * 0.5:
-                        continue  # pico fraco demais - provavelmente ruído/borda
-                    gx, gy = lx + bx1, ly + by1  # centro da cor deste robô, em coords globais
-                    # Estima o centro geométrico do robô projetando a partir do
-                    # centróide de cor PARA O LADO OPOSTO ao centro do blob
-                    # fundido - replica a relação cor->centro do caminho de 1
-                    # robô, evitando ancorar posição/direção na mancha de cor.
-                    away = np.array([gx, -gy]) - np.array([cx, -cy])
-                    away_norm = np.linalg.norm(away)
-                    away = away / away_norm if away_norm > 1e-6 else np.array([1.0, 0.0])
-                    offset_mag = max(playerRadius - mainColorRadius, 0.3 * playerRadius)
-                    est_xi = gx + away[0] * offset_mag
-                    est_yi = gy - away[1] * offset_mag
-                    direction = np.array([est_xi, -est_yi]) - np.array([gx, -gy])
-                    modDir = np.linalg.norm(direction)
-                    if modDir > 1e-6:
-                        direction = direction / modDir
-                    gxcm, gycm = self.GetPointVirtual(self.TransformPoint(np.array([est_xi, est_yi])))
-                    wx1, wy1 = max(0, int(est_xi - half_win)), max(0, int(est_yi - half_win))
-                    wx2, wy2 = min(img.shape[1], int(est_xi + half_win)), min(img.shape[0], int(est_yi + half_win))
-                    sub_window = img[wy1:wy2, wx1:wx2]
-                    if sub_window.size == 0:
-                        continue
-                    cand = {
-                        "xi": est_xi, "yi": est_yi, "ri": playerRadius,
-                        "x_m": gx, "y_m": gy,
-                        "xcm": gxcm, "ycm": gycm, "rcm": 5.30,
-                        "direction": direction,
-                        "windowActual": sub_window,
-                        "contour": cnt,
-                    }
-                    out.append((is_enemy, cand))
-            return out
+            # Cria máscara da região do blob (apenas o contorno)
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+            cv2.drawContours(mask, [cnt], -1, 255, -1)
 
-        # ----------------------------------------------------------------------
-        # Loop único sobre os contornos CRUS - substitui inteiramente o gate
-        # de is_square. Classificação só por tamanho relativo a 1 robô.
-        # ----------------------------------------------------------------------
+            # Pega o bounding box para limitar as operações (otimização)
+            x, y, w, h = cv2.boundingRect(cnt)
+            margin = int(0.3 * winSize)
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(img.shape[1], x + w + margin)
+            y2 = min(img.shape[0], y + h + margin)
+
+            # Recorta a máscara para a ROI do blob
+            roi_mask = mask[y1:y2, x1:x2]
+            if roi_mask.size == 0:
+                return []
+
+            # Kernel de erosão (pequeno, para não perder a forma)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            current = roi_mask.copy()
+            centers = []
+            max_iter = 25
+            min_area = 5  # área mínima para considerar um componente válido
+
+            for i in range(max_iter):
+                # Encontra componentes conectados (8-conectividade)
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                    current, connectivity=8
+                )
+                # Ignora o fundo (label 0)
+                valid = []
+                for l in range(1, num_labels):
+                    area = stats[l, cv2.CC_STAT_AREA]
+                    if area >= min_area:
+                        valid.append(l)
+                if len(valid) >= n_est:
+                    # Pega os centroides dos primeiros n_est componentes
+                    # (ordem arbitrária, mas consistente)
+                    for l in valid[:n_est]:
+                        cx_roi = centroids[l][0] + x1
+                        cy_roi = centroids[l][1] + y1
+                        centers.append((cx_roi, cy_roi))
+                    break
+                # Erosão
+                current = cv2.erode(current, kernel, iterations=1)
+                if cv2.countNonZero(current) == 0:
+                    break
+            else:
+                # Se não separou, usa o que tem (mas pode ser insuficiente)
+                # Vamos tentar usar os componentes atuais (mesmo que menos que n_est)
+                if centers:
+                    pass  # já temos alguns centros
+                else:
+                    # Fallback: pega o centroide do blob inteiro (um só)
+                    centers.append((cx, cy))
+
+            return centers
+
+        # ======== 6. Helper: Complemento com Kalman ==================
+        def _get_kalman_centers(team, n_needed):
+            """
+            Retorna até n_needed centros previstos pelo Kalman para robôs do time
+            que não foram detectados. Usa posição prevista (predict) para os slots.
+            """
+            team_list = self.allyTeam if team == ID_Team.TEAM_ALLY else self.enemyTeam
+            centers = []
+            for bot in team_list:
+                if bot.kalman_initialized:
+                    # Prediz para o timestamp atual
+                    x_pred, y_pred, _ = bot.predict(timestamp)
+                    # Converte para coordenadas de imagem (pixels)
+                    xi, yi = self.GetImageIndice((x_pred, y_pred))
+                    centers.append((xi, yi))
+                    if len(centers) >= n_needed:
+                        break
+            return centers
+    
+        # ========= 7. LOOP PRINCIPAL =======================
         raw_contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in raw_contours:
             if self.playersCount >= 6:
                 break
             (cx, cy), r = cv2.minEnclosingCircle(cnt)
+
             if r < NOISE_RADIUS_MIN:
-                continue  # ruído da máscara, menor que qualquer robô plausível
+                continue
+
+            # Desenhando os blobs
+            cv2.drawContours(self.binaryPlayers, [cnt], -1, 255, -1)
+
             area = cv2.contourArea(cnt)
+            
             if area <= 0:
                 area = np.pi * r * r
             n_est = max(1, round(area / player_area_px))
-            n_est = min(n_est, 6 - self.playersCount)  # não estoura o número de slots restantes
+            n_est = min(n_est, 6 - self.playersCount)
+
+            if debug:
+                color_circle = (0, 165, 255) if n_est > 1 else (0, 255, 0)
+                cv2.circle(self.frameResult, (int(cx), int(cy)), int(r) + 5, color_circle, 2)
+
+            # Se for um candidato só ele faz o tratamento simples.
             if n_est <= 1:
-                result = _build_single_candidate(cnt, cx, cy)
-                if debug:
-                    cv2.circle(self.frameResult, (int(cx), int(cy)), int(r) + 5, (0, 255, 0), 2)
-                if result is None:
-                    continue
-                team_is_enemy, cand = result
-                (enemy_candidates if team_is_enemy else ally_candidates).append(cand)
-                self.playersCount += 1
-            else:
-                if debug:
-                    cv2.circle(self.frameResult, (int(cx), int(cy)), int(r) + 5, (0, 165, 255), 2)  # laranja = blob fundido
-                split_results = _split_merged_blob(cnt, cx, cy, n_est)
-                for team_is_enemy, cand in split_results:
-                    if self.playersCount >= 6:
-                        break
+                result = _build_candidate_from_center(cx, cy, cnt)
+                if result is not None:
+                    team_is_enemy, cand = result
                     (enemy_candidates if team_is_enemy else ally_candidates).append(cand)
                     self.playersCount += 1
 
-        # --------------------------------------------------------------------
-        # INIMIGOS - pareamento por vizinho mais próximo + gating (FIX #4 e #5)
-        # --------------------------------------------------------------------
+            ## Aqui ele trata do blob fundido, ou seja o 
+            ## TRATAMENTO DE COLISÕES.
+            else:
+                # Bloco fundido -> aplica erosão iterativa
+                centers = _split_by_erosion(cnt, cx, cy, n_est)
+
+                # Se o número de centros encontrados for menor que n_est, complementa com Kalman
+                if len(centers) < n_est:
+                    # Estima quantos faltam
+                    need = n_est - len(centers)
+                    kalman_centers = _get_kalman_centers(ID_Team.TEAM_ALLY, need) + \
+                                    _get_kalman_centers(ID_Team.TEAM_ENEMY, need)
+                    # Ordena pela distância ao centro do blob
+                    kalman_centers.sort(key=lambda p: np.hypot(p[0]-cx, p[1]-cy))
+                    # Adiciona os primeiros `need` que não estejam muito longe
+                    for (px, py) in kalman_centers[:need]:
+                        # Verifica se está dentro do blob (ou próximo)
+                        if np.hypot(px-cx, py-cy) < 2 * r:  # dentro do raio do blob
+                            centers.append((px, py))
+                            if len(centers) >= n_est:
+                                break
+
+                # Agora, para cada centro, constrói candidato
+                for (cx_i, cy_i) in centers[:n_est]:
+                    result = _build_candidate_from_center(cx_i, cy_i, cnt=None)
+                    if result is not None:
+                        team_is_enemy, cand = result
+                        (enemy_candidates if team_is_enemy else ally_candidates).append(cand)
+                        self.playersCount += 1
+                        if self.playersCount >= 6:
+                            break
+
+        # ================= 8. Associação de inimigos =============
         if enemy_candidates:
             pairs = []
             n_slots = min(3, len(self.enemyTeam))
@@ -2237,9 +2273,8 @@ class VisionSystem:
                     bgr_s = self.Hsv2Bgr(Color_s)
                     cv2.circle(self.frameResult, (cx3, cy3), 4, (0, 0, 0), -1)
                     cv2.circle(self.frameResult, (cx3, cy3), 3, bgr_s, -1)
-        # --------------------------------------------------------------------
-        # ALIADOS - identidade por cor secundária conhecida + gating (FIX #5)
-        # --------------------------------------------------------------------
+
+        #================== 9. Associação de aliados ==============
         for cand in ally_candidates:
             if self.alliesCount >= 3:
                 break
@@ -2266,10 +2301,18 @@ class VisionSystem:
                 bot.setStatus(True)
                 bot.setRadius(cand["rcm"])
                 bot.setColor(colorT=self.allyColor, colorP=c1, colorS=c2)
+
+                if cand["contour"] is not None:
+                    cv2.drawContours(self.binaryAllies, [cand["contour"]], -1, 255, -1)
+                else:
+                    cv2.circle(self.binaryAllies, (int(cand["xi"]), int(cand["yi"])), int(cand["ri"]), 255, -1)
+
                 if debug:
                     self.DrawPlayerCircle(self.frameResult, bot)
+
                 self.DrawPlayerVirtual(bot)
                 self._ally_last_pos[bot_id] = (cand["xcm"], cand["ycm"])
+
                 if bot_id == ID_Robots.ROBOT_ALLY_GOAL:
                     AgoalFlag = True
                 elif bot_id == ID_Robots.ROBOT_ALLY_1:
@@ -2280,15 +2323,13 @@ class VisionSystem:
                     cv2.circle(self.frameResult, (int(cand["x_m"]), int(cand["y_m"])), 4, (255, 128, 255), -1)
                 assigned = True
                 break
+
             if not assigned:
                 continue
+
             self.alliesCount = min(self.alliesCount + 1, 3)
-            if debug:
-                cv2.drawContours(binaryAllies, [cand["contour"]], -1, 255, -1)
-                cv2.drawContours(binaryAllTeam, [cand["contour"]], -1, 255, -1)
-        if debug:
-            self.binaryAllies = binaryAllies
-            self.binaryAllTeam = binaryAllTeam
+
+        # ================== 10. Finalização ================
         self._countProcess += 1
 
     #desenhar robôs na imagem
@@ -2985,8 +3026,8 @@ class VisionSystem:
             cont_global[:, 0, 1] += y0
             if self.binaryPlayers is not None:
                 cv2.drawContours(self.binaryPlayers, [cont_global], -1, 255, -1)
-            if team_type == "ally" and self.binaryAllTeam is not None:
-                cv2.drawContours(self.binaryAllTeam, [cont_global], -1, 255, -1)
+            if team_type == "ally" and self.binaryAllies is not None:
+                cv2.drawContours(self.binaryAllies, [cont_global], -1, 255, -1)
 
         return found
     
@@ -3206,9 +3247,9 @@ class VisionSystem:
         # ==========================================================
         self.binaryBall = np.zeros((H, W), dtype=np.uint8)
         self.binaryPlayers = np.zeros((H, W), dtype=np.uint8)
-        self.binaryAllTeam = np.zeros((H, W), dtype=np.uint8)
-        self.binaryObjects = np.zeros((H, W), dtype=np.uint8)
         self.binaryAllies = np.zeros((H, W), dtype=np.uint8)
+        self.binaryAllyConfirmed = np.zeros((H,W),dtype=np.uint8)
+        self.binaryObjects = np.zeros((H, W), dtype=np.uint8)
         self.binReduceField = np.zeros((H, W), dtype=np.uint8)
         self.binField = np.zeros((H, W), dtype=np.uint8)
         # ==========================================================
