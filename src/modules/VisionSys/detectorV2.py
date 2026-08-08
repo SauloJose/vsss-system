@@ -80,7 +80,7 @@ class VisionSystem:
         # DetectBotInRoi/SearchBot (candidatos dentro da janela prevista pelo Kalman),
         # para que as duas vias de detecção rejeitem candidatos igualmente implausíveis
         # antes de alimentar o filtro.
-        self.MAX_JUMP_CM = 50.0
+        self.MAX_JUMP_CM = 20.0
         #+====================================================================================
 
         #variável que me dirá quantas vezes o sistema de visão foi chamado
