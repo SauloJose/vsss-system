@@ -276,69 +276,55 @@ class Ball:
 
 
 
-    def get_roi(self, image_shape, t_now, vision_sys, scale_std=3):
+    def get_roi(self, image_shape, t_now, scale_std=3, min_size_cm=10.0):
         """
-        Retorna as dimensões do ROI centrado na previsão do Kalman, convertendo cm para pixels.
+        Retorna a janela de busca prevista pelo Kalman em coordenadas do MUNDO
+        VIRTUAL (cm): (x_cm, y_cm, w_cm, h_cm) — canto superior-esquerdo + dimensões.
+
+        Assinatura igual à de Robot.get_roi(image_shape, t_now): o detector
+        (PredictBall / DrawKalmanWindows) chama get_roi sem passar nenhum objeto de
+        sistema de visão e depois converte o resultado de cm para pixels através de
+        VisionSystem.GetRoiImg. Antes, este método pedia um `vision_sys` obrigatório
+        (usado só para projetar cm -> pixels "na mão") e devolvia pixels diretamente,
+        o que não batia com a forma como é chamado no resto do código — daí o erro.
+
+        A janela nunca é menor que min_size_cm x min_size_cm e cresce conforme a
+        incerteza (P) do filtro aumenta: quanto mais incerto o Kalman, maior a área
+        de busca devolvida.
         """
         if not self.kalman_initialized or self.kalman_last_time is None:
-            return 0, 0, image_shape[1], image_shape[0] # Retorna imagem inteira se não inicializado
-
-        # --- 1) Posição predita pelo Kalman (Em Centímetros) ---
-        x_pred, y_pred, _ = self.predict(t_now)
-
-        # --- 2) CONVERSÃO CRÍTICA: Centímetros globais -> Pixels Absolutos da Imagem ---
-        x_img, y_img = vision_sys.getImageRealIndice([x_pred, y_pred])
-
-        # --- 3) AJUSTE DE RECORTE: Tornar o pixel relativo à subimagem fieldReduce ---
-        if vision_sys.viewCapture.cooVetor is not None:
-            x_offset, y_offset = vision_sys.viewCapture.cooVetor[0], vision_sys.viewCapture.cooVetor[1]
-            x_c = x_img - x_offset
-            y_c = y_img - y_offset
+            # Sem Kalman inicializado ainda: usa a última posição conhecida com a
+            # janela mínima, centrada nela.
+            x_pred, y_pred = float(self.position[0]), float(self.position[1])
+            w_cm = h_cm = float(min_size_cm)
         else:
-            x_c, y_c = x_img, y_img
+            # --- 1) Posição predita pelo Kalman (em cm), sem alterar o filtro ---
+            x_pred, y_pred, _ = self.predict(t_now)
 
-        # --- 4) FATOR DE ESCALA DINÂMICO: Pixels por Centímetro ---
-        # Baseado no último raio da bola mapeado em pixels (self.rb) vs raio real (self.radius)
-        pixels_per_cm = (self.rb / self.radius) if (hasattr(self, 'rb') and self.rb > 0) else 5.0
+            # --- 2) Propagação da covariância (incerteza acumulada em dt), em cm ---
+            dt = max(t_now - self.kalman_last_time, 0.0)
+            F_space = np.array([
+                [1, 0, dt, 0],
+                [0, 1, 0, dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ])
+            # Isola submatrizes de posição/velocidade [x, y, vx, vy] da bola
+            P_sub = self.kalman_P[[0, 1, 3, 4], :][:, [0, 1, 3, 4]]
+            Q_sub = self.kalman_Q[[0, 1, 3, 4], :][:, [0, 1, 3, 4]]
+            P_pred_space = F_space @ P_sub @ F_space.T + Q_sub
 
-        # --- 5) PROPAÇÃO DA COVARIÂNCIA (Incerteza acumulada no tempo dt) ---
-        dt = max(t_now - self.kalman_last_time, 0.0)
-        F_space = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
-        # Isola submatrizes de posição/velocidade [x, y, vx, vy] da bola para projetar P_pred
-        P_sub = self.kalman_P[[0,1,3,4], :][:, [0,1,3,4]]
-        Q_sub = self.kalman_Q[[0,1,3,4], :][:, [0,1,3,4]]
-        P_pred_space = F_space @ P_sub @ F_space.T + Q_sub
+            # Desvio-padrão da posição já em cm (estado do Kalman é em cm).
+            std_x = float(np.sqrt(max(P_pred_space[0, 0], 0.0)))
+            std_y = float(np.sqrt(max(P_pred_space[1, 1], 0.0)))
 
-        # Desvio padrão convertido de centímetros para PIXELS
-        std_x = np.sqrt(P_pred_space[0, 0]) * pixels_per_cm
-        std_y = np.sqrt(P_pred_space[1, 1]) * pixels_per_cm
+            w_cm = max(scale_std * std_x * 2.0, min_size_cm)
+            h_cm = max(scale_std * std_y * 2.0, min_size_cm)
 
-        # --- 6) Define tamanho do ROI em pixels ---
-        w_roi = int(scale_std * std_x * 2)
-        h_roi = int(scale_std * std_y * 2)
+        x_cm = x_pred - w_cm / 2.0
+        y_cm = y_pred - h_cm / 2.0
 
-        # [CORREÇÃO] Margem de segurança baseada no tamanho real da bola na tela
-        min_dim = int(3.5 * self.rb) if (hasattr(self, 'rb') and self.rb > 0) else 35
-        w_roi = max(w_roi, min_dim)
-        h_roi = max(h_roi, min_dim)
-        
-        # --- 7) Topo-esquerdo do ROI ---
-        x = int(x_c - w_roi // 2)
-        y = int(y_c - h_roi // 2)
-
-        # --- 8) Ajusta limites às dimensões da imagem enviada ---
-        h_img, w_img = image_shape[:2]
-        x = max(0, min(x, w_img - 1))
-        y = max(0, min(y, h_img - 1))
-        w_roi = min(w_roi, w_img - x)
-        h_roi = min(h_roi, h_img - y)
-
-        return x, y, w_roi, h_roi
+        return x_cm, y_cm, w_cm, h_cm
 
     # ======================================================================
     # 🔹 Utilitários

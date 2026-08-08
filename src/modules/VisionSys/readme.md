@@ -1,307 +1,289 @@
-Com base nas atualizações do código, aqui está o README.md revisado:
-
-# Sistema de Visão VSS (Vision System Soccer) v2.3.2
+# Sistema de Visão VSS (Vision System Soccer) v3.2
 
 ## 📋 Visão Geral
 
-O **Sistema de Visão VSS** é um módulo de detecção de objetos em tempo real desenvolvido para competições de futebol de robôs. O sistema processa imagens de campo, detectando bola, robôs aliados e inimigos, utilizando técnicas avançadas de visão computacional e filtros de Kalman para rastreamento.
+O **Sistema de Visão VSS** é um módulo de detecção e rastreamento de objetos em tempo real, projetado para competições de futebol de robôs. Ele processa imagens do campo, identifica a bola, robôs aliados e inimigos, utilizando técnicas de visão computacional combinadas com **filtros de Kalman** (EKF para robôs) para oferecer rastreamento robusto e preditivo.
 
-### 🎯 Características Principais
-- Detecção em tempo real de múltiplos objetos
-- Suporte a processamento CPU/GPU
-- Sistema de coordenadas virtual para mapeamento preciso
-- **Filtros de Kalman EKF** para predição de movimento com modelo diferencial
-- **Sistema de cores hierárquico** para identificação robusta de robôs
-- Arquitetura multi-thread para alto desempenho
-- **Detecção filtrada** com ROI baseada em predição do Kalman
+A arquitetura foi reorganizada em **9 blocos funcionais** que separam claramente:
 
-## 🏗️ Arquitetura do Sistema
+- Inicialização e controle da classe
+- Processamento auxiliar de imagens
+- Desenho e depuração
+- Transformações geométricas e homografia
+- Localização geométrica por tags (protocolo de cores)
+- Detecção de campo, bola e jogadores
+- Detecção adaptativa com ROI (Kalman)
+- Predição e fallback com Kalman
+- Pipelines principais (detecção completa e rastreamento filtrado)
 
-### Classes Principais
+---
 
-### 1. `VisionSystem` - Classe Principal
+## 🎯 Características Principais
 
-**Responsabilidade**: Orquestrar todo o pipeline de processamento de visão
+- **Detecção em tempo real** de múltiplos objetos (6 robôs + bola)
+- **Rastreamento por Filtro de Kalman**:
+  - **EKF** para robôs com modelo diferencial (velocidades das rodas no estado)
+  - **KF linear** para bola (posição + velocidade)
+- **ROI adaptativa** baseada na covariância do filtro para busca otimizada
+- **Sistema hierárquico de cores** (`TreeColors`) com tolerância a variações de iluminação
+- **Pipeline híbrido**: detecção completa nos primeiros frames, depois rastreamento filtrado
+- **Fallback inteligente**: predição do Kalman mantém a estimativa durante oclusões
+- **Suporte a GPU** (CUDA) para processamento paralelo
+- **Modo debug** com visualização de ROIs, vetores de direção e máscaras binárias
 
-**Métodos Principais Atualizados**:
+---
 
-#### `processImg(img, debug)`
-Gerencia o modo de operação inteligente:
-- **Fase 1** (primeiros 60 frames): Processamento completo para alimentar o Kalman
-- **Fase 2**: Detecção filtrada usando predição do Kalman
-- **Atualização Periódica**: Processamento completo a cada `newProcTime`
+## 🏗️ Arquitetura da Classe `VisionSystem`
 
-#### `filtered_detection(img, currentTime, debug)`
-Nova detecção otimizada:
-- Usa Kalman para prever ROIs reduzidas
-- Busca seletiva em janelas otimizadas
-- Fallback para predição quando detecção falha
+A classe principal está organizada nos seguintes blocos funcionais (ordem de declaração):
 
-#### `search_bots(img, timestamp, debug)`
-Processamento paralelizado de robôs:
-- Cada robô busca em sua ROI predita
-- Aplicação de fallback coordenado
+| Bloco | Nome | Responsabilidade |
+|-------|------|------------------|
+| 1 | **Métodos de controle** | Inicialização, configuração, criação de objetos, reset, obtenção de dados |
+| 2 | **Funções auxiliares** | Processamento de imagem (gray, blur, binarização, morfologia), redução de janela, conversão de cores, manipulação de contornos |
+| 3 | **Funções de desenho e debug** | Renderização de círculos, setas, textos, máscaras e ROIs para depuração |
+| 4 | **Processamento geométrico puro** | Cálculo de homografia, transformação de coordenadas (real ↔ virtual ↔ cm), detecção de formas (quadrados) |
+| 5 | **Localização geométrica do robô** | Implementação do protocolo de tags (Tag_Time, T1, T2) para orientação e identificação por cores |
+| 6 | **Detecção principal** | `DetectField`, `DetectBall`, `DetectPlayers` – pipeline completo de detecção por frame |
+| 7 | **Detecção adaptativa com ROI** | `SearchBots`, `DetectBotInRoi`, `SearchBot`, `SearchBall` – busca em janelas preditas pelo Kalman |
+| 8 | **Predição e filtragem Kalman** | Cálculo de ROI, predição de posição, fallback para objetos perdidos |
+| 9 | **Pipelines principais** | `Proc` (detecção completa), `ProcessImg` (orquestrador), `FilteredDetection` (rastreamento otimizado) |
 
-### 2. `Ball` - Classe da Bola (Atualizada)
+---
 
-**Modelo de Estado Kalman**:
+## 🔧 Fluxo de Processamento
+
+### 1. Modo Imagem (único quadro)
+- `ProcessImg` chama `Proc` com `force_field_detect=True`.
+- `Proc` executa detecção completa: campo → bola → jogadores.
+- Resultado é retornado sem rastreamento.
+
+### 2. Modo Vídeo (contínuo, com Kalman)
+- **Fase de aquecimento** (primeiros 12000 frames ≈ 400s a 30fps):
+  - Executa `Proc` com `force_field_detect=False` (reutiliza ROI do campo).
+  - Alimenta os filtros de Kalman com as medições.
+- **Fase de rastreamento** (após aquecimento):
+  - `ProcessImg` chama `FilteredDetection`:
+    1. Prediz ROI da bola e dos robôs usando `predictBall`/`predictRobot`.
+    2. Busca apenas dentro dessas janelas (redução de ~80% da área).
+    3. Se encontrado, atualiza o filtro com `updatePosition`.
+    4. Se não encontrado, incrementa contador de falhas.
+    5. Se exceder limite, marca para reset do filtro.
+    6. Fallback: usa predição do Kalman para manter estimativa.
+- **Recalibração periódica**: a cada `newProcTime` (10s), executa `Proc` para corrigir deriva.
+
+### 3. Gerenciamento de Falhas
+- **Campo**: se `DetectField` falhar por 10 quadros consecutivos, reset completo do sistema.
+- **Bola**: se não detectada por 10 quadros, o filtro é reiniciado na próxima detecção.
+- **Robôs**: se não detectados por 15 quadros, o filtro é reiniciado na próxima detecção.
+
+---
+
+## 🎨 Sistema de Cores – `TreeColors`
+
+A classe `TreeColors` gerencia a identificação hierárquica de robôs com base em três cores:
+
+- **Cor do time** (Tag_Time) – presente na parte inferior do robô.
+- **Cor primária** (Tag_T1) – canto superior esquerdo.
+- **Cor secundária** (Tag_T2) – canto superior direito.
+
+### Cadastro
 ```python
-Estado: [x, y, θ, vx, vy] (5 dimensões)
-Medição: [x, y, θ]
-```
-
-**Características**:
-- θ derivado exclusivamente do movimento (não medido)
-- ROI adaptativa baseada na covariância do Kalman
-- Suporte a predição sem alterar estado do filtro
-
-### 3. `Robot` - Classe dos Robôs (Atualizada)
-
-**Novo Modelo EKF**:
-```python
-Estado: [x, y, θ, v_esquerda, v_direita, ω] (6 dimensões)
-Medição: [x, y, θ]
-```
-
-**Características**:
-- **Modelo de movimento diferencial** não-linear
-- Jacobiano computado para EKF
-- Velocidades das rodas no estado do filtro
-- ROI baseada em covariância predita
-
-### 4. `TreeColors` - Nova Classe de Gerenciamento de Cores
-
-**Funcionalidades**:
-```python
-# Cadastro hierárquico de cores
 tree.add_robot(team_id, robot_id, main_hsv, primary_hsv, secondary_hsv)
+```
 
-# Busca inteligente por cores
+### Busca
+```python
 match = tree.find_by_colors(main_candidate, primary_candidate, secondary_candidate)
+# Retorna: {'team': team_id, 'robot_id': robot_id} ou None
 ```
 
-**Vantagens**:
-- Tolerância a faixas de Hue circulares
-- Sistema de scoring por similaridade
-- Fallback para combinações parciais
-- Debug visual integrado
+### Tolerâncias
+- **Hue**: tratamento de wrap circular (0–179) com tolerância ajustável.
+- **Saturação e Valor**: limites configuráveis para robustez à iluminação.
 
-## 🔧 Sistema de Coordenadas e Transformações
+---
 
-### Pipeline de Transformação (Atualizado)
+## 📐 Transformações Geométricas
 
-```python
-# Exemplo com fallback de predição
-if detection_success:
-    xv, yv = self.transformPoint(np.array([xb, yb]))        # px_virtual  
-    xcm, ycm = self.getPointVirtual(np.array([xv, yv]))     # cm
-    self.ball.setPosition(xcm, ycm, rb, timestamp)          # atualiza KF
-else:
-    # Usa predição do Kalman sem atualizar filtro
-    self._predict_ball_fallback(timestamp, mark_detected=False)
+O sistema utiliza **homografia** para mapear a imagem real para uma imagem virtual de dimensões fixas (645×413 px, proporção 3 px/cm).
+
+| Método | Entrada | Saída | Descrição |
+|--------|---------|-------|-----------|
+| `GetHomographyMatrix` | 4 pontos reais, 4 pontos virtuais | Matriz 3×3 | Calcula a homografia. |
+| `TransformPoint` | ponto (px real) | ponto (px virtual) | Aplica homografia direta. |
+| `InvTransformPoint` | ponto (px virtual) | ponto (px real) | Aplica homografia inversa. |
+| `GetPointVirtual` | ponto (px virtual) | (x, y) em cm no sistema O' | Converte para coordenadas do campo (centro em (0,0)). |
+| `GetImageIndice` | (x, y) em cm | ponto (px virtual) | Inverso de `GetPointVirtual`. |
+| `GetImageRealIndice` | (x, y) em cm | ponto (px real) | Combina `GetImageIndice` + `InvTransformPoint`. |
+
+---
+
+## 🤖 Filtro de Kalman – Robôs (EKF)
+
+**Modelo de estado** (6 dimensões):
+```
+[x, y, θ, vL, vR, ω]^T
 ```
 
-## 🎨 Sistema de Cores e Detecção
-
-### Nova Arquitetura de Cores
-
-#### `TreeColors` - Sistema Hierárquico
-```python
-# Estrutura de armazenamento
-_store: {
-    (team_id, robot_id): {
-        'colors': {
-            'main': [H, S, V],
-            'primary': [H, S, V], 
-            'secondary': [H, S, V]
-        },
-        'bounds': { ... },  # Limites pré-computados
-        'tolerances': { ... }
-    }
-}
+**Modelo de movimento** (diferencial):
+```
+v = (vL + vR) / 2
+x' = x + v·dt·cos(θ)
+y' = y + v·dt·sin(θ)
+θ' = θ + ω·dt
+vL' = vL
+vR' = vR
+ω'  = ω
 ```
 
-#### Pipeline de Identificação
-1. **Filtro por Bounds**: Verificação rápida por limites HSV
-2. **Scoring por Similaridade**: Métrica combinada (Hue, Saturação, Valor)
-3. **Fallback Parcial**: Match com main + primary se combinação completa falhar
+**Observação**: `[x, y, θ]` (posição e orientação).
 
-### Detecção de Robôs Aprimorada
+**ROI adaptativa**: baseada na covariância predita, dimensionada por `scale_std=3`.
 
-```python
-# Novo fluxo com TreeColors
-match = self.colorTree.find_by_colors(main_color, primary_color, secondary_color)
-if match and match['robot_id'] == expected_id:
-    bot.updatePosition(xcm, ycm, direction, window, timestamp)
+---
+
+## ⚽ Filtro de Kalman – Bola
+
+**Modelo de estado** (5 dimensões):
+```
+[x, y, θ, vx, vy]^T
 ```
 
-## 🔮 Filtro de Kalman Avançado
-
-### 🤖 Modelo EKF para Robôs
-
-**Equações de Movimento Diferencial**:
-```python
-def _non_linear_motion_model(self, state, dt):
-    x, y, theta, vL, vR, omega = state[:, 0]
-    v = (vL + vR) / 2.0
-    
-    x_new = x + v * dt * np.cos(theta)
-    y_new = y + v * dt * np.sin(theta) 
-    theta_new = theta + omega * dt
-    # ... manter velocidades constantes
+**Modelo de movimento** (linear):
+```
+x' = x + vx·dt
+y' = y + vy·dt
+θ' = θ   (derivado do movimento, não medido)
+vx' = vx
+vy' = vy
 ```
 
-**Jacobiano**:
-```python
-def _jacobian_motion_model(self, state, dt):
-    # Matriz 6x6 com derivadas parciais
-    # Inclui termos de acoplamento entre posição e orientação
-```
+**Observação**: `[x, y]` (apenas posição). A orientação θ é derivada do vetor velocidade e não é observada diretamente.
 
-### ⚽ Kalman para Bola
+---
 
-**Modelo Linear Simplificado**:
-```python
-F = np.array([
-    [1, 0, 0, dt, 0],   # x
-    [0, 1, 0, 0, dt],   # y  
-    [0, 0, 1, 0, 0],    # theta
-    [0, 0, 0, 1, 0],    # vx
-    [0, 0, 0, 0, 1]     # vy
-])
-```
+## 🔍 Detecção Filtrada – `FilteredDetection`
 
-## 🔍 Sistema de Detecção Filtrada
+Pipeline otimizado que substitui a detecção completa após o aquecimento:
 
-### Fluxo Otimizado de Rastreamento
+1. **Recorte do campo** a partir do ROI salvo (`viewCapture.cooVetor`).
+2. **Predição da bola** → `predictBall` → ROI em pixels.
+3. **Busca da bola** na ROI → `SearchBall`.
+   - Se encontrada: atualiza Kalman com `updatePosition`.
+   - Se não: incrementa `missed_frames_ball`; se > limite, marca para reset.
+4. **Predição dos robôs** → `predictRobot` para cada robô (aliados e inimigos).
+5. **Busca de robôs** na ROI → `SearchBots` → chama `DetectBotInRoi` para cada um.
+   - Para cada robô encontrado: atualiza Kalman com `updatePosition`.
+   - Para cada robô não encontrado: `HandleRobotLoss` (predição ou reset).
+6. **Fallback**: se o robô/bola está perdido, usa a predição do Kalman para manter a estimativa (sem atualizar o filtro).
+7. **Desenho de debug**: ROIs, círculos, setas e textos.
 
-1. **Predição do ROI**:
-   ```python
-   roi = self.predictRobot(img_shape, team, robot_id, timestamp)
-   # Baseado na covariância do Kalman (scale_std = 3)
-   ```
+---
 
-2. **Busca em Janela Reduzida**:
-   ```python
-   window = img[y0:y0+h0, x0:x0+w0]
-   found = self.search_bot(img, roi, team, bot_id, timestamp, debug)
-   ```
+## ⚡ Otimizações de Desempenho
 
-3. **Fallback Inteligente**:
-   - Predição do Kalman sem atualização do filtro
-   - Manutenção da direção e velocidade atuais
-   - Status `detected = False` para indicar predição
+- **Cache de HSV**: `hsv_fieldReduce` é calculado uma vez por frame e reutilizado.
+- **Estruturas morfológicas pré-criadas**: `struct_ellipse5`, `struct_rect11`, `kernel_morph`.
+- **Recorte de campo com cache**: quando `force_field_detect=False`, reutiliza ROI anterior.
+- **Busca em janelas reduzidas**: apenas a área prevista pelo Kalman é processada.
+- **Uso de `SafeCall`**: tratamento de exceções para evitar crashes e manter o fluxo.
 
-### Benefícios da Nova Abordagem
+---
 
-- **Performance**: Redução de ~80% na área de busca
-- **Robustez**: Continua operando durante oclusões parciais
-- **Precisão**: ROI adaptativa baseada na incerteza do Kalman
-- **Consistência**: Transição suave entre detecção e predição
-
-## ⚡ Otimizações e Performance
-
-### 1. Gerenciamento de Estado Aprimorado
-```python
-def resetExecutionState(self):
-    """Reset seletivo - preserva Kalman e histórico"""
-    # Limpa apenas estado temporário do frame
-    # Mantém: kalman_state, position_history, velocity
-```
-
-### 2. Controle de Falhas em Campo
-```python
-def _check_field_reset(self):
-    """Reset completo após múltiplas falhas consecutivas"""
-    if self.fieldDetectionFailCount >= self.maxFieldFailures:
-        self._resetVs()  # Recria todos os objetos
-```
-
-### 3. Processamento Paralelo
-```python
-# Busca paralela de robôs usando ThreadPool
-with ThreadPoolExecutor(max_workers=3) as executor:
-    futures = [executor.submit(self._process_single_bot, ...) for bot in team]
-```
-
-## 🎯 Configuração
-
-### Novos Parâmetros do Sistema
-```python
-# TreeColors
-hue_tolerance = 10      # Tolerância circular do Hue
-score_threshold = 200.0 # Limiar de similaridade
-
-# Kalman ROI
-scale_std = 3          # Multiplicador do desvio padrão para ROI
-min_roi_size = 12      # Tamanho mínimo da janela de busca
-```
-
-## 📊 Saída do Sistema
-
-### Estrutura de Dados Atualizada
-```python
-objects = {
-    ID_Objects.ALLIES: [
-        robotAllyG,  # .detected = True/False (deteção real/predição)
-        robotAlly1, 
-        robotAlly2
-    ],
-    ID_Objects.ENEMIES: [...],
-    ID_Objects.BALL: ball_object,
-    'timestamp': self.dT,
-    'processing_mode': 'full|filtered'  # Novo campo
-}
-```
-
-### Novas Imagens de Debug
-- `binaryBall`: Bola com blob da detecção atual
-- `virtualImg`: Setas de direção e orientação dos robôs
-- **TreeColors Debug**: Impressão hierárquica das cores cadastradas
-
-## 🚀 Uso Básico (Atualizado)
+## 🖥️ Uso Básico
 
 ```python
-# Inicialização com nova árvore de cores
+from modules.VisionSys.vision_system import VisionSystem
+from modules.VisionSys.components.config import EConfig
+
+# Configuração
 config = EConfig()
+config.fieldWidth = 150
+config.fieldHeight = 130
+config.ballColor = [10, 200, 200]  # HSV
+config.allyColor = [30, 200, 200]
+config.enemyColor = [110, 200, 200]
+
+# Inicialização
 vs = VisionSystem(config=config, debug=True)
 
-# Processamento inteligente (auto-ajustável)
+# Loop de captura
 while True:
-    img = capture.getImage()
-    result = vs.processImg(img, debug=True)
-    
-    # Obter dados com informação de modo
-    objects = vs.getObjects()
+    img = capture.read()  # imagem BGR
+    timestamp = time.time() * 1000  # ms
+
+    # Processamento
+    result_img = vs.ProcessImg(img, debug=True)
+
+    # Obter objetos
+    objects = vs.GetObjects()
     ball = objects[ID_Objects.BALL]
-    
+    allies = objects[ID_Objects.ALLIES]
+
     if ball.detected:
-        print(f"Bola detectada: {ball.position}")
+        print(f"Bola: ({ball.x:.2f}, {ball.y:.2f}) cm")
     else:
-        print(f"Bola predita: {ball.position}")
+        print(f"Bola predita: ({ball.x:.2f}, {ball.y:.2f}) cm")
 ```
 
-## ⚠️ Considerações Técnicas Atualizadas
+---
 
-### Kalman e Modelos de Movimento
-1. **Robôs**: EKF com modelo diferencial - requer calibração de parâmetros (axle_length)
-2. **Bola**: Modelo linear - θ derivado do movimento (pode acumular erro)
-3. **Inicialização**: Primeiros frames críticos para convergência do filtro
+## 🧪 Debug e Visualização
 
-### TreeColors e Identificação
-1. **Calibração**: Requer configuração precisa das cores principais e secundárias
-2. **Iluminação**: Tolerâncias devem ser ajustadas para condições de luz
-3. **Oclusão**: Sistema funciona com cores parciais (main + primary)
+Com `debug=True`:
+- **Máscaras binárias** (`GetDebugImages`): objetos, bola, jogadores, aliados.
+- **Desenho na imagem**: círculos, IDs, setas de direção.
+- **ROIs do Kalman**: retângulos amarelos (bola) e coloridos (robôs).
+- **Imagem virtual**: campo com posições projetadas e orientações.
 
-### Performance em Tempo Real
-1. **Fase Inicial**: 60 frames de processamento completo para estabilizar Kalman
-2. **Operação Normal**: 80-90% de redução no processamento com detecção filtrada
-3. **Recuperação**: Reset automático após falhas persistentes
+Para obter as máscaras:
+```python
+bin_objects, bin_ball, bin_players, bin_allies = vs.GetDebugImages()
+```
 
-### Validação Recomendada
-- Testar transição entre detecção e predição
-- Validar ROIs em diferentes velocidades
-- Verificar matching de cores sob variação de iluminação
-- Monitorar covariância do Kalman para detectar divergência
+---
 
-Este sistema fornece uma base robusta e eficiente para detecção em tempo real, com arquitetura adaptativa que balanceia precisão e performance em ambientes dinâmicos de competição robótica.
+## 📁 Estrutura de Arquivos (Módulos)
+
+```
+modules/VisionSys/
+├── vision_system.py          # Classe VisionSystem (este arquivo)
+├── components/
+│   ├── objects.py            # Definições de ID_Team, ID_Robots, ID_Objects
+│   ├── viewcapture.py        # ViewCapture (ROI do campo)
+│   ├── field.py              # Classe Field
+│   ├── ball.py               # Classe Ball (com Kalman)
+│   ├── robot.py              # Classe Robot (com EKF)
+│   └── combination.py        # TreeColors e utilitários de cores
+└── ...
+```
+
+---
+
+## ⚙️ Parâmetros Ajustáveis
+
+| Parâmetro | Valor padrão | Descrição |
+|-----------|--------------|-----------|
+| `MAX_MISSED_FRAMES_BALL` | 10 | Frames sem detecção antes de resetar o Kalman da bola. |
+| `MAX_MISSED_FRAMES_ROBOT` | 15 | Frames sem detecção antes de resetar o Kalman do robô. |
+| `MAX_JUMP_CM` | 50.0 | Distância máxima (cm) aceita entre a predição e a medição (gating). |
+| `newProcTime` | 10000 ms | Intervalo para recalibração completa (detecção de campo). |
+| `scale_std` (no `get_roi`) | 3.0 | Multiplicador do desvio padrão para definir ROI. |
+| `hue_tolerance` (cores) | 10 | Tolerância do matiz (circular). |
+| `saturation_tolerance` | 50 | Tolerância da saturação. |
+| `value_tolerance` | 50 | Tolerância do valor (brilho). |
+
+---
+
+## 🧠 Considerações de Projeto
+
+- **Separação de responsabilidades**: cada bloco funcional tem um propósito claro, facilitando manutenção e testes.
+- **Robustez**: tratamento de exceções e fallbacks garantem que o sistema não pare abruptamente.
+- **Extensibilidade**: novos robôs ou cores podem ser adicionados via `TreeColors` sem modificar a lógica principal.
+- **Performance**: o pipeline híbrido (completo ↔ filtrado) reduz drasticamente o custo computacional após a estabilização do Kalman.
+- **Precisão**: o EKF com modelo diferencial captura melhor a dinâmica dos robôs, especialmente em curvas e paradas.
+
+---
+
+Este sistema foi desenvolvido e testado para competições VSS, oferecendo um equilíbrio entre precisão, velocidade e adaptabilidade às condições de jogo.

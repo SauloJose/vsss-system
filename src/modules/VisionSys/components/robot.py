@@ -171,28 +171,6 @@ class Robot:
         self.radius = float(r)
         self.axle_length = 2 * self.radius
 
-    def setPositionNoKalman(self, x, y, theta, timestamp, image=None):
-        """ Atualiza a posição do robô sem realizar a predição do EKF """
-        self.lastPosition = self.position.copy()
-        self.position = np.array([x, y], dtype=float)
-        self.newPosition = self.position.copy()
-
-        self.theta = theta  # Atualiza direction e normaliza theta automaticamente
-
-        self.lastTimestamp = self.newTimestamp
-        self.newTimestamp = timestamp
-        self.dT = max(self.newTimestamp - self.lastTimestamp, 1e-3)
-
-        if image is not None:
-            self.image = image
-            self.viewRect.setDimension(image.shape[1])
-
-        self.objLimit = Circle(Point2D(x, y), self.radius)
-        self.updateBbox()
-        self.viewRect.updateViewBot(Point2D(x, y))
-
-        self.detected = False
-
     # --------------------------
     # Modelo Não-Linear do EKF (5D)
     # --------------------------
@@ -262,45 +240,45 @@ class Robot:
     # --------------------------
     # ROI & Predições Futuras
     # --------------------------
-    def get_roi(self, image_shape, t_now, vision_sys, scale_std=3):
+    def get_roi(self, image_shape, t_now, scale_std=3, min_size_cm=14.0):
+        """
+        Retorna a janela de busca prevista pelo Kalman em coordenadas do MUNDO
+        VIRTUAL (cm): (x_cm, y_cm, w_cm, h_cm) — canto superior-esquerdo + dimensões.
+
+        Esta assinatura é intencionalmente igual à de Ball.get_roi(image_shape, t_now):
+        o detector (PredictRobot / DrawKalmanWindows / SearchBots) chama get_roi sem
+        passar nenhum objeto de sistema de visão e depois converte o resultado de cm
+        para pixels através de VisionSystem.GetRoiImg — exatamente como já é feito
+        para a bola. Antes, este método pedia um `vision_sys` obrigatório e devolvia
+        pixels diretamente, o que não batia com a forma como é chamado no restante
+        do código (chamada quebrada / TypeError silencioso via SafeCall).
+
+        A janela nunca é menor que min_size_cm x min_size_cm (~14cm, equivalente a
+        ~100px na escala típica do campo) e cresce conforme a incerteza (P) do
+        filtro aumenta — ou seja, quanto mais incerto o Kalman, maior a área de
+        busca devolvida.
+        """
         if not self.kalman_initialized or self.kalman_last_time is None:
-            return 0, 0, image_shape[1], image_shape[0]
-
-        st_pred, P_pred = self.predict_with_cov(t_now)
-        x_pred = st_pred[0, 0]
-        y_pred = st_pred[1, 0]
-
-        x_img, y_img = vision_sys.getImageRealIndice([x_pred, y_pred])
-
-        if vision_sys.viewCapture.cooVetor is not None:
-            x_offset, y_offset = vision_sys.viewCapture.cooVetor[0], vision_sys.viewCapture.cooVetor[1]
-            x_c = x_img - x_offset
-            y_c = y_img - y_offset
+            # Sem Kalman inicializado ainda: usa a última posição conhecida com a
+            # janela mínima, centrada nela.
+            x_pred, y_pred = float(self.position[0]), float(self.position[1])
+            w_cm = h_cm = float(min_size_cm)
         else:
-            x_c, y_c = x_img, y_img
+            st_pred, P_pred = self.predict_with_cov(t_now)
+            x_pred = float(st_pred[0, 0])
+            y_pred = float(st_pred[1, 0])
 
-        pixels_per_cm = (self.ri / self.radius) if self.ri > 0 else 5.0
+            # Desvio-padrão da posição já está em cm (estado do Kalman é em cm).
+            std_x = float(np.sqrt(max(P_pred[0, 0], 0.0)))
+            std_y = float(np.sqrt(max(P_pred[1, 1], 0.0)))
 
-        std_x = np.sqrt(P_pred[0, 0]) * pixels_per_cm
-        std_y = np.sqrt(P_pred[1, 1]) * pixels_per_cm
+            w_cm = max(scale_std * std_x * 2.0, min_size_cm)
+            h_cm = max(scale_std * std_y * 2.0, min_size_cm)
 
-        w_roi = int(scale_std * std_x * 2)
-        h_roi = int(scale_std * std_y * 2)
+        x_cm = x_pred - w_cm / 2.0
+        y_cm = y_pred - h_cm / 2.0
 
-        min_dimension = int(3.0 * self.ri) if self.ri > 0 else int(2.5 * self.radius * pixels_per_cm)
-        w_roi = max(w_roi, min_dimension)
-        h_roi = max(h_roi, min_dimension)
-
-        x = int(x_c - w_roi // 2)
-        y = int(y_c - h_roi // 2)
-
-        h_img, w_img = image_shape[:2]
-        x = max(0, min(x, w_img - 1))
-        y = max(0, min(y, h_img - 1))
-        w_roi = min(w_roi, w_img - x)
-        h_roi = min(h_roi, h_img - y)
-
-        return x, y, w_roi, h_roi
+        return x_cm, y_cm, w_cm, h_cm
 
     def predict(self, time):
         """ Prediz o estado futuro [x, y, theta] usando modelo não-linear 5D """
