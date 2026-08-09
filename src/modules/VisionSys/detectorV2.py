@@ -2476,41 +2476,47 @@ class VisionSystem:
     
     # Método novo para procurar se existe um robô na janela
     def SearchBots(self, img, timestamp, debug=False) -> list:
-            if img is None:
-                return []
+        if img is None:
+            return []
 
-            H, W = img.shape[:2]
-            
-            detected_list = []
+        H, W = img.shape[:2]
+        detected_list = []
+        processed_rois = set()  # Evita processar a mesma ROI mais de uma vez
 
-            # Lista de alvos: (ObjetoRobo, EnumTime)
-            targets = []
-            for b in self.allyTeam:
-                targets.append((b, ID_Team.TEAM_ALLY))
-            for b in self.enemyTeam:
-                targets.append((b, ID_Team.TEAM_ENEMY))
+        # Lista de alvos: (ObjetoRobo, EnumTime)
+        targets = []
+        for b in self.allyTeam:
+            targets.append((b, ID_Team.TEAM_ALLY))
+        for b in self.enemyTeam:
+            targets.append((b, ID_Team.TEAM_ENEMY))
 
-            for bot, team_enum in targets:
-                # 1. PREDIÇÃO: Pega imagem cortada e retângulo
-                roi_img, roi_rect = self.PredictRobot([H, W], team_enum, bot.id, timestamp)
+        # Primeiro, tenta a geometria de tags para cada robô
+        for bot, team_enum in targets:
+            roi_img, roi_rect = self.PredictRobot([H, W], team_enum, bot.id, timestamp)
+            if roi_img is None or roi_img.size == 0:
+                continue
 
-                # Se não retornou imagem válida (ex: fora do campo), pula
-                if roi_img is None or roi_img.size == 0:
-                    continue
+            # Tenta detectar via geometria de tags
+            result = self.DetectBotInRoi(roi_img, roi_rect, bot, debug)
+            if result:
+                detected_list.extend(result)
+                if debug:
+                    xr, yr, wr, hr = roi_rect
+                    cv2.rectangle(self.frameResult, (xr, yr), (xr+wr, yr+hr), (0, 255, 0), 1)
+            else:
+                # Se falhou, marca a ROI para processamento via candidatos (colisão)
+                roi_key = (roi_rect[0], roi_rect[1], roi_rect[2], roi_rect[3])
+                if roi_key not in processed_rois:
+                    processed_rois.add(roi_key)
+                    # Processa a ROI para detectar todos os robôs ali
+                    roi_results = self._ProcessROIForRobots(roi_img, roi_rect, timestamp, debug)
+                    if roi_results:
+                        detected_list.extend(roi_results)
+                        if debug:
+                            xr, yr, wr, hr = roi_rect
+                            cv2.rectangle(self.frameResult, (xr, yr), (xr+wr, yr+hr), (0, 255, 255), 2)  # amarelo para indicar fallback
 
-                # 2. DETECÇÃO: Passa a imagem cortada
-                # Nota: 'img' global não é passada, passamos 'roi_img'
-                result = self.DetectBotInRoi(roi_img, roi_rect, bot, debug)
-
-                if result:
-                    detected_list.extend(result)
-                    
-                    # Debug Visual: Desenhar o retângulo onde o robô foi buscado
-                    if debug:
-                        xr, yr, wr, hr = roi_rect
-                        cv2.rectangle(self.frameResult, (xr, yr), (xr+wr, yr+hr), (0, 255, 0), 1)
-
-            return detected_list
+        return detected_list
 
     def DetectBotInRoi(self, roi_img, roi_rect, target_bot, debug=False) -> list:
             """
@@ -3024,6 +3030,58 @@ class VisionSystem:
                 bot.setStatus(False)
                 self.robot_kalman_reset_flags[key] = True
 
+    def _ProcessROIForRobots(self, roi_img, roi_rect, timestamp, debug=False):
+        """
+        Processa a ROI usando a lógica de DetectPlayers (candidatos + associação)
+        para detectar robôs naquela região. Retorna uma lista de dicionários com
+        as detecções (mesmo formato de DetectBotInRoi) para que o FilteredDetection
+        possa atualizar o Kalman.
+        """
+        if roi_img is None or roi_img.size == 0:
+            return []
+        x0, y0, w0, h0 = roi_rect
+        # Converter a ROI para HSV
+        roi_hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+        # Chamar DetectPlayerCandidates com offset (coordenadas globais)
+        ally_candidates, enemy_candidates = self.DetectPlayerCandidates(
+            roi_img, roi_hsv, timestamp, x_offset=x0, y_offset=y0, debug=debug
+        )
+        # Se não houver candidatos, retorna vazio
+        if not ally_candidates and not enemy_candidates:
+            return []
+        
+        # Agora precisamos identificar cada candidato e montar um dicionário similar ao do DetectBotInRoi
+        # Vamos usar a árvore de cores para identificar o robô e construir o resultado
+        results = []
+        all_candidates = ally_candidates + enemy_candidates
+        for cand in all_candidates:
+            # Identifica pela cor
+            main_color = self.allyColor if cand in ally_candidates else self.enemyColor
+            match, Color_p, Color_s = self.IdentifyCandidateByColor(cand, roi_hsv, main_color)
+            if match is None:
+                continue
+            bot_id = match['robot_id']
+            team = match['team']
+            bot = self.GetBotById(team, bot_id)
+            if bot is None:
+                continue
+            # Construir dicionário de resultado
+            result_data = {
+                "id": bot_id,
+                "team": team,
+                "x": cand["xcm"],
+                "y": cand["ycm"],
+                "theta": np.arctan2(cand["direction"][1], cand["direction"][0]),
+                "direction": cand["direction"],
+                "img_x": int(cand["xi"]),
+                "img_y": int(cand["yi"]),
+                "img_r": int(cand["ri"]),
+                "bot_win": cand["windowActual"],
+                "contour_global": cand.get("contour", None)
+            }
+            results.append(result_data)
+        return results
+
     # ==========================================================================================
     # BLOCO 9: PIPELINE PRINCIPAL (PROC, PROCESSIMG E FILTEREDDETECTION)
     # ==========================================================================================
@@ -3450,6 +3508,15 @@ class VisionSystem:
         # ==========================================================
         # 4) Watchdog (Robôs perdidos)
         # ==========================================================
+        # Primeiro, garantir que robôs detectados por outros métodos (ex: ROI) sejam considerados
+        for bot, team in [(b, ID_Team.TEAM_ALLY) for b in self.allyTeam] + \
+                        [(b, ID_Team.TEAM_ENEMY) for b in self.enemyTeam]:
+            key = (bot.id, team)
+            if bot.detected and key not in updated_keys:
+                updated_keys.add(key)
+                self.missed_frames_robots[key] = 0
+
+        # Agora, aplicar watchdog para os que não foram detectados
         for bot, team in [(b, ID_Team.TEAM_ALLY) for b in self.allyTeam] + \
                         [(b, ID_Team.TEAM_ENEMY) for b in self.enemyTeam]:
             key = (bot.id, team)
@@ -3457,6 +3524,7 @@ class VisionSystem:
                 self.SafeCall(self.HandleRobotLoss, bot, team, currentTime)
 
         return self.frameResult
+
 
 # ==========================================================================================
 # TESTE DA CLASSE
