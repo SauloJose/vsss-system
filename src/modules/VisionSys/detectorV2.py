@@ -4,14 +4,16 @@
 '''
     @GNOMIO: Sismtea de detecção de objetos VSS (Vision System Soccer) versão 3.2.13   
     
-    Versão: v3.2.45
-    Última modificação: 03/08/206
+    Versão: v3.3.22
+    Última modificação: 08/08/206
     Autor: Saulo (update)
 
-    Patch Notes v3.2.45:
+    Patch Notes v3.3.22:
     - Estou resolvendo a questão das colisões em que os blobs tem mais de um robô;
     - Estou corrigindo a conexão com o filtro de KALMAN, para que esteja tudo bem sintonizado;
     - Aguardo novas informações
+    - Modularizado o a função DetectPlayers em funções menores, facilitando a manutenção do código 
+      e replicar em outras partes.
 
     Obs: Ainda está numa versão BETA, necessário testes para verificar se está
     corretamente funcionando!!!
