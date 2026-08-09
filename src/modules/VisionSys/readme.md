@@ -1,20 +1,24 @@
-# Sistema de Visão VSS (Vision System Soccer) v3.2
+# Sistema de Visão VSS (Vision System Soccer) v3.3.22
 
 ## 📋 Visão Geral
 
 O **Sistema de Visão VSS** é um módulo de detecção e rastreamento de objetos em tempo real, projetado para competições de futebol de robôs. Ele processa imagens do campo, identifica a bola, robôs aliados e inimigos, utilizando técnicas de visão computacional combinadas com **filtros de Kalman** (EKF para robôs) para oferecer rastreamento robusto e preditivo.
 
-A arquitetura foi reorganizada em **9 blocos funcionais** que separam claramente:
+A arquitetura atual foi reorganizada em **9 blocos funcionais** que separam claramente:
 
-- Inicialização e controle da classe
-- Processamento auxiliar de imagens
-- Desenho e depuração
-- Transformações geométricas e homografia
-- Localização geométrica por tags (protocolo de cores)
-- Detecção de campo, bola e jogadores
-- Detecção adaptativa com ROI (Kalman)
-- Predição e fallback com Kalman
-- Pipelines principais (detecção completa e rastreamento filtrado)
+1. Métodos de controle (inicialização, configuração, reset)
+2. Funções auxiliares de processamento de imagem
+3. Desenho e depuração
+4. Transformações geométricas e homografia
+5. Localização geométrica por tags (protocolo de cores)
+6. Detecção principal (campo, bola, jogadores)
+7. Detecção adaptativa com ROI (Kalman)
+8. Predição e fallback com Kalman
+9. Pipelines principais (detecção completa e rastreamento filtrado)
+
+**Versão atual:** v3.3.22 (BETA)  
+**Última modificação:** 08/08/206 (nota: data fictícia)  
+**Autor:** Saulo (update)
 
 ---
 
@@ -28,14 +32,17 @@ A arquitetura foi reorganizada em **9 blocos funcionais** que separam claramente
 - **Sistema hierárquico de cores** (`TreeColors`) com tolerância a variações de iluminação
 - **Pipeline híbrido**: detecção completa nos primeiros frames, depois rastreamento filtrado
 - **Fallback inteligente**: predição do Kalman mantém a estimativa durante oclusões
+- **Tratamento de colisões**: detecção de blobs com múltiplos robôs e separação por erosão iterativa
+- **Gating de distância**: rejeição de medições implausíveis (saltos > `MAX_JUMP_CM`)
+- **Watchdog** para reset automático do filtro após perda prolongada
 - **Suporte a GPU** (CUDA) para processamento paralelo
-- **Modo debug** com visualização de ROIs, vetores de direção e máscaras binárias
+- **Modo debug** com visualização de ROIs, máscaras binárias e vetores de direção
 
 ---
 
 ## 🏗️ Arquitetura da Classe `VisionSystem`
 
-A classe principal está organizada nos seguintes blocos funcionais (ordem de declaração):
+A classe principal está organizada nos seguintes blocos funcionais (ordem de declaração no código):
 
 | Bloco | Nome | Responsabilidade |
 |-------|------|------------------|
@@ -44,7 +51,7 @@ A classe principal está organizada nos seguintes blocos funcionais (ordem de de
 | 3 | **Funções de desenho e debug** | Renderização de círculos, setas, textos, máscaras e ROIs para depuração |
 | 4 | **Processamento geométrico puro** | Cálculo de homografia, transformação de coordenadas (real ↔ virtual ↔ cm), detecção de formas (quadrados) |
 | 5 | **Localização geométrica do robô** | Implementação do protocolo de tags (Tag_Time, T1, T2) para orientação e identificação por cores |
-| 6 | **Detecção principal** | `DetectField`, `DetectBall`, `DetectPlayers` – pipeline completo de detecção por frame |
+| 6 | **Detecção principal** | `DetectField`, `DetectBall`, `DetectPlayers` – pipeline completo de detecção por frame (modularizada em 3 partes) |
 | 7 | **Detecção adaptativa com ROI** | `SearchBots`, `DetectBotInRoi`, `SearchBot`, `SearchBall` – busca em janelas preditas pelo Kalman |
 | 8 | **Predição e filtragem Kalman** | Cálculo de ROI, predição de posição, fallback para objetos perdidos |
 | 9 | **Pipelines principais** | `Proc` (detecção completa), `ProcessImg` (orquestrador), `FilteredDetection` (rastreamento otimizado) |
@@ -64,15 +71,15 @@ A classe principal está organizada nos seguintes blocos funcionais (ordem de de
   - Alimenta os filtros de Kalman com as medições.
 - **Fase de rastreamento** (após aquecimento):
   - `ProcessImg` chama `FilteredDetection`:
-    1. Prediz ROI da bola e dos robôs usando `predictBall`/`predictRobot`.
+    1. Prediz ROI da bola e dos robôs usando `PredictBall`/`PredictRobot`.
     2. Busca apenas dentro dessas janelas (redução de ~80% da área).
     3. Se encontrado, atualiza o filtro com `updatePosition`.
-    4. Se não encontrado, incrementa contador de falhas.
-    5. Se exceder limite, marca para reset do filtro.
-    6. Fallback: usa predição do Kalman para manter estimativa.
+    4. Se não encontrado, incrementa contador de falhas (`missed_frames`).
+    5. Se exceder limite (`MAX_MISSED_FRAMES_*`), marca para reset do filtro.
+    6. Fallback: usa predição do Kalman para manter estimativa sem atualizar.
 - **Recalibração periódica**: a cada `newProcTime` (10s), executa `Proc` para corrigir deriva.
 
-### 3. Gerenciamento de Falhas
+### 3. Gerenciamento de Falhas (Watchdog)
 - **Campo**: se `DetectField` falhar por 10 quadros consecutivos, reset completo do sistema.
 - **Bola**: se não detectada por 10 quadros, o filtro é reiniciado na próxima detecção.
 - **Robôs**: se não detectados por 15 quadros, o filtro é reiniciado na próxima detecção.
@@ -83,9 +90,11 @@ A classe principal está organizada nos seguintes blocos funcionais (ordem de de
 
 A classe `TreeColors` gerencia a identificação hierárquica de robôs com base em três cores:
 
-- **Cor do time** (Tag_Time) – presente na parte inferior do robô.
-- **Cor primária** (Tag_T1) – canto superior esquerdo.
-- **Cor secundária** (Tag_T2) – canto superior direito.
+- **Cor do time** (Tag_Time) – presente na parte inferior do robô (retângulo `L × L/2`).
+- **Cor primária** (Tag_T1) – canto superior esquerdo (quadrado `L/2 × L/2`).
+- **Cor secundária** (Tag_T2) – canto superior direito (quadrado `L/2 × L/2`).
+
+Onde `L = 7.5 cm` (dimensão padrão do robô).
 
 ### Cadastro
 ```python
@@ -99,14 +108,14 @@ match = tree.find_by_colors(main_candidate, primary_candidate, secondary_candida
 ```
 
 ### Tolerâncias
-- **Hue**: tratamento de wrap circular (0–179) com tolerância ajustável.
-- **Saturação e Valor**: limites configuráveis para robustez à iluminação.
+- **Hue**: tratamento de wrap circular (0–179) com tolerância ajustável (padrão ±10).
+- **Saturação e Valor**: limites configuráveis (padrão ±50).
 
 ---
 
 ## 📐 Transformações Geométricas
 
-O sistema utiliza **homografia** para mapear a imagem real para uma imagem virtual de dimensões fixas (645×413 px, proporção 3 px/cm).
+O sistema utiliza **homografia** para mapear a imagem real para uma imagem virtual de dimensões fixas (645×413 px, proporção 3 px/cm). As coordenadas são então convertidas para um sistema O' com origem no centro do campo (em cm).
 
 | Método | Entrada | Saída | Descrição |
 |--------|---------|-------|-----------|
@@ -139,7 +148,7 @@ vR' = vR
 
 **Observação**: `[x, y, θ]` (posição e orientação).
 
-**ROI adaptativa**: baseada na covariância predita, dimensionada por `scale_std=3`.
+**ROI adaptativa**: baseada na covariância predita, dimensionada por `scale_std=3`. A ROI é calculada em centímetros e convertida para pixels via `GetRoiImg`.
 
 ---
 
@@ -168,16 +177,29 @@ vy' = vy
 Pipeline otimizado que substitui a detecção completa após o aquecimento:
 
 1. **Recorte do campo** a partir do ROI salvo (`viewCapture.cooVetor`).
-2. **Predição da bola** → `predictBall` → ROI em pixels.
+2. **Predição da bola** → `PredictBall` → ROI em pixels.
 3. **Busca da bola** na ROI → `SearchBall`.
    - Se encontrada: atualiza Kalman com `updatePosition`.
    - Se não: incrementa `missed_frames_ball`; se > limite, marca para reset.
-4. **Predição dos robôs** → `predictRobot` para cada robô (aliados e inimigos).
+4. **Predição dos robôs** → `PredictRobot` para cada robô (aliados e inimigos).
 5. **Busca de robôs** na ROI → `SearchBots` → chama `DetectBotInRoi` para cada um.
    - Para cada robô encontrado: atualiza Kalman com `updatePosition`.
    - Para cada robô não encontrado: `HandleRobotLoss` (predição ou reset).
 6. **Fallback**: se o robô/bola está perdido, usa a predição do Kalman para manter a estimativa (sem atualizar o filtro).
 7. **Desenho de debug**: ROIs, círculos, setas e textos.
+
+### Modularização da Detecção de Jogadores
+
+A função `DetectPlayers` foi dividida em três partes reutilizáveis:
+
+- **Parte 1 – `DetectPlayerCandidates`**  
+  Gera máscara genérica, extrai contornos e classifica por tamanho. Para blobs grandes (colisões), delega para a Parte 2.
+
+- **Parte 2 – `ResolveCollisionBlob`**  
+  Trata blobs com múltiplos robôs usando erosão iterativa (`_SplitBlobByErosion`) e complementa com predição do Kalman (`_GetKalmanPredictedCenters`).
+
+- **Parte 3 – `AssociatePlayerCandidates`**  
+  Identifica a qual robô específico cada candidato pertence (por cores e posição), atualiza o filtro de Kalman e gerencia a árvore de cores.
 
 ---
 
@@ -188,6 +210,7 @@ Pipeline otimizado que substitui a detecção completa após o aquecimento:
 - **Recorte de campo com cache**: quando `force_field_detect=False`, reutiliza ROI anterior.
 - **Busca em janelas reduzidas**: apenas a área prevista pelo Kalman é processada.
 - **Uso de `SafeCall`**: tratamento de exceções para evitar crashes e manter o fluxo.
+- **Caching de pontos de homografia** para evitar recriação de arrays numpy a cada frame.
 
 ---
 
@@ -283,6 +306,15 @@ modules/VisionSys/
 - **Extensibilidade**: novos robôs ou cores podem ser adicionados via `TreeColors` sem modificar a lógica principal.
 - **Performance**: o pipeline híbrido (completo ↔ filtrado) reduz drasticamente o custo computacional após a estabilização do Kalman.
 - **Precisão**: o EKF com modelo diferencial captura melhor a dinâmica dos robôs, especialmente em curvas e paradas.
+- **Tratamento de colisões**: a abordagem baseada em erosão + predição do Kalman melhora a recuperação em situações de aglomeração.
+
+---
+
+## 🔮 Próximos Passos (Patch Notes v3.3.22)
+
+- Refinamento do tratamento de colisões (separação de blobs com múltiplos robôs).
+- Ajuste fino dos parâmetros do filtro de Kalman (sintonização).
+- Testes extensivos em condições reais de jogo.
 
 ---
 

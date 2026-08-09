@@ -3,8 +3,8 @@ from modules.VisionSys.components.objects import *
 
 class Ball:
     """
-    Classe da bola com suporte a direção, orientação e filtro de Kalman.
-    OBS: a visão NÃO detecta theta. Ele é derivado do movimento.
+    Classe da bola com filtro de Kalman (estado: x, y, vx, vy).
+    A orientação (theta) é derivada da velocidade filtrada.
     """
 
     def __init__(self, x=0, y=0, r=0):
@@ -12,11 +12,9 @@ class Ball:
         self.position = np.array([x, y], dtype=float)
         self.radius = float(r)
 
-        # Direção (unitária)
+        # Direção (unitária) e theta serão derivados da velocidade
         self._direction = np.array([0.0, 0.0], dtype=float)
-
-        # Orientação (derivada *somente* do movimento)
-        self._theta = 0.0  # rad
+        self._theta = 0.0
 
         # --- Estruturas geométricas ---
         self.objLimit = Circle(Point2D(x, y), self.radius)
@@ -37,28 +35,23 @@ class Ball:
         self.lastPosition = self.position.copy()
         self.newPosition = self.position.copy()
         self.velocity = np.array([0.0, 0.0], dtype=float)
-        self.omega = 0.0  # Velocidade angular derivada (não observada)
+        self.omega = 0.0  # Velocidade angular (não usada, mantida para compatibilidade)
 
-        # --- Kalman: estado [x, y, theta, vx, vy] (5D) ---
-        # OBS: omega NÃO faz parte do vetor de estado do filtro (theta é modelado
-        # como constante na transição). self.omega abaixo é apenas derivado/auxiliar.
+        # --- Kalman: estado [x, y, vx, vy] (4D) ---
         self.kalman_initialized = False
         self.kalman_last_time = None
 
-        self.kalman_state = np.zeros((5, 1))
-        self.kalman_P = np.eye(5) * 500.0
+        self.kalman_state = np.zeros((4, 1))
+        self.kalman_P = np.eye(4) * 100.0          # incerteza inicial
 
-        self.kalman_Q = np.eye(5) * 0.05
-        self.kalman_R = np.eye(3)
-        self.kalman_R[0, 0] = 3.0     # x
-        self.kalman_R[1, 1] = 3.0     # y
-        self.kalman_R[2, 2] = 300.0   # theta é ruidoso
+        self.kalman_Q = np.diag([1.0, 1.0, 10.0, 10.0])   # ruído do processo
+        self.kalman_R = np.diag([3.0, 3.0])               # ruído da medição (x, y)
 
         # Cor da bola (médio HSV)
         self.color = None
 
     # ============================================================
-    #         DIRECTION  <->  THETA (ANGULO)
+    #         PROPRIEDADES DE DIREÇÃO (derivadas da velocidade)
     # ============================================================
 
     @property
@@ -67,12 +60,11 @@ class Ball:
 
     @direction.setter
     def direction(self, d):
+        # Mantido para compatibilidade, mas prefira derivar da velocidade
         d = np.asarray(d, dtype=float)
         norm = np.linalg.norm(d)
-
         if norm < 1e-6:
             return
-
         d = d / norm
         self._direction = d
         self._theta = float(np.arctan2(d[1], d[0]))
@@ -87,25 +79,33 @@ class Ball:
         self._direction = np.array([np.cos(self._theta),
                                     np.sin(self._theta)], dtype=float)
 
+    def _update_direction_from_velocity(self):
+        """Atualiza direção e theta a partir da velocidade filtrada (ou atual)."""
+        vx, vy = self.velocity_filtered if self.kalman_initialized else self.velocity
+        norm = np.hypot(vx, vy)
+        if norm > 1e-6:
+            self._direction = np.array([vx / norm, vy / norm])
+            self._theta = float(np.arctan2(vy, vx))
+        # se velocidade zero, mantém a direção anterior
+
     # ======================================================================
     # 🔹 Atualização de posição
     # ======================================================================
 
     def setPosition(self, x, y, r, timestamp=0.0, theta=None):
         """
-        Define posição inicial da bola.
-        A BOLA NÃO TEM θ MEDIDO — sempre ignorar theta externo.
+        Define posição inicial da bola (primeira medição).
+        O theta é ignorado – será derivado da velocidade (zero inicialmente).
         """
-
         self.radius = float(r)
 
         self.position = np.array([x, y], dtype=float)
         self.lastPosition = self.position.copy()
         self.newPosition = self.position.copy()
 
-        # direção e theta zerados, pois não há movimento
-        self.direction = np.array([0.0, 0.0])
-        self.theta = 0.0
+        # Velocidade inicial nula
+        self.velocity = np.array([0.0, 0.0])
+        self._update_direction_from_velocity()
 
         self.oldTimestamp = timestamp
         self.newTimestamp = timestamp
@@ -114,42 +114,42 @@ class Ball:
         self.updateBbox()
         self.status = True
 
-        # Inicializa Kalman com (x, y, θ=0)
-        self.update_kalman(np.array([x, y, self.theta]), timestamp)
+        # Inicializa Kalman com (x, y) e velocidade zero
+        self.update_kalman(np.array([x, y]), timestamp)
 
     def updatePosition(self, x, y, r, timestamp, theta=None):
         """
         Atualiza posição da bola e aplica filtro de Kalman.
-        A bola NÃO recebe theta externo. Sempre derivamos do movimento.
+        O theta é ignorado – a direção é derivada da velocidade estimada.
         """
-
         self.radius = float(r)
 
         self.lastPosition = self.position.copy()
         self.newPosition = np.array([x, y], dtype=float)
         self.position = self.newPosition.copy()
 
-        # --- Direção e orientação derivadas do deslocamento ---
+        # --- Velocidade derivada do deslocamento (para fins de medição, mas o Kalman estima) ---
         delta = self.newPosition - self.lastPosition
-        n = np.linalg.norm(delta)
-
-        if n > 1e-6:
-            self.direction = delta / n
-            self.theta = float(np.arctan2(self.direction[1], self.direction[0]))
-        # se não houver deslocamento, mantém direção e theta
+        dt = max(timestamp - self.newTimestamp, 1e-3)
+        if dt > 0:
+            self.velocity = delta / dt  # velocidade bruta (não filtrada)
 
         # --- Tempo ---
-        self.dT = max(timestamp - self.newTimestamp, 1e-3)
+        self.dT = dt
         self.oldTimestamp = self.newTimestamp
         self.newTimestamp = timestamp
 
-        # --- Kalman usa x, y e theta derivado ---
-        self.update_kalman(np.array([x, y, self.theta]), timestamp)
+        # --- Kalman usa apenas (x, y) como medição ---
+        self.update_kalman(np.array([x, y]), timestamp)
+
+        # Atualiza direção a partir da velocidade filtrada
+        self._update_direction_from_velocity()
 
         self.updateBbox()
         self.status = True
 
     def setPositionNoKalman(self, x, y, r, timestamp=0.0, theta=None):
+        """Atualiza posição sem tocar no Kalman (fallback)."""
         self.radius = float(r)
 
         self.lastPosition = self.position.copy()
@@ -157,7 +157,7 @@ class Ball:
         self.newPosition = self.position.copy()
 
         if theta is not None:
-            self.theta = theta   # atualiza direction internamente
+            self.theta = theta
         else:
             # mantém direção atual
             pass
@@ -168,22 +168,24 @@ class Ball:
 
         self.updateBbox()
         self.viewBall.updateViewBot(Point2D(x, y))
-
-        # NÃO CHAMA update_kalman
-        self.status = False
+        self.status = False  # não detectado
 
     # ======================================================================
-    # 🔹 Filtro de Kalman (estado completo)
+    # 🔹 Filtro de Kalman (estado 4D: x, y, vx, vy)
     # ======================================================================
 
-    def update_kalman(self, meas_xyz, timestamp):
-        mx, my, mtheta = meas_xyz.reshape(3,)
-        z = np.array([[mx], [my], [mtheta]])
+    def update_kalman(self, meas_xy, timestamp):
+        """
+        Atualiza o filtro com a medição de posição (x, y).
+        """
+        z = np.array([[meas_xy[0]], [meas_xy[1]]])
 
         if not self.kalman_initialized:
-            self.kalman_state[0, 0] = mx
-            self.kalman_state[1, 0] = my
-            self.kalman_state[2, 0] = mtheta
+            self.kalman_state[0, 0] = z[0, 0]
+            self.kalman_state[1, 0] = z[1, 0]
+            # velocidade inicial assume zero
+            self.kalman_state[2, 0] = 0.0
+            self.kalman_state[3, 0] = 0.0
             self.kalman_last_time = timestamp
             self.kalman_initialized = True
             return
@@ -191,18 +193,18 @@ class Ball:
         dt = max(timestamp - self.kalman_last_time, 1e-3)
         self.kalman_last_time = timestamp
 
+        # Matriz de transição (movimento de velocidade constante)
         F = np.array([
-            [1, 0, 0, dt, 0],
-            [0, 1, 0, 0, dt],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1],
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
         ])
 
+        # Matriz de observação (medimos apenas posição)
         H = np.array([
-            [1, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0],
-            [0, 0, 1, 0, 0]
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
         ])
 
         # Predição
@@ -210,19 +212,13 @@ class Ball:
         self.kalman_P = F @ self.kalman_P @ F.T + self.kalman_Q
 
         # Inovação
-        y_res = z - (H @ self.kalman_state)
-        y_res[2, 0] = (y_res[2, 0] + np.pi) % (2 * np.pi) - np.pi
-
+        y_res = z - H @ self.kalman_state
         S = H @ self.kalman_P @ H.T + self.kalman_R
         K = self.kalman_P @ H.T @ np.linalg.inv(S)
 
         # Atualização
         self.kalman_state += K @ y_res
-        
-        # [CORREÇÃO] Normaliza o ângulo interno do vetor de estado para evitar estouro de escala
-        self.kalman_state[2, 0] = (self.kalman_state[2, 0] + np.pi) % (2 * np.pi) - np.pi
-        self.theta = float(self.kalman_state[2, 0])
-
+        self.kalman_P = (np.eye(4) - K @ H) @ self.kalman_P
 
     # ======================================================================
     # 🔹 Propriedades filtradas
@@ -233,27 +229,32 @@ class Ball:
         return self.kalman_state[0:2, 0]
 
     @property
+    def velocity_filtered(self):
+        return self.kalman_state[2:4, 0]
+
+    @property
     def theta_filtered(self):
-        return self.kalman_state[2, 0]
+        """Orientação derivada da velocidade filtrada."""
+        vx, vy = self.velocity_filtered
+        return float(np.arctan2(vy, vx))
 
     @property
     def direction_filtered(self):
         th = self.theta_filtered
         return np.array([np.cos(th), np.sin(th)])
 
-    @property
-    def velocity_filtered(self):
-        return self.kalman_state[3:5, 0]
-
     # ======================================================================
     # 🔹 Previsão
     # ======================================================================
+
     def predict(self, timestamp):
-        # Se o Kalman nunca foi inicializado, devolve estado atual sem previsão
+        """
+        Retorna (x_pred, y_pred, theta_pred) para compatibilidade.
+        O theta_pred é derivado da velocidade predita.
+        """
         if not self.kalman_initialized or self.kalman_last_time is None:
             return self.position[0], self.position[1], self.theta
 
-        # dt relativo ao último UPDATE real, não altera estado
         dt = timestamp - self.kalman_last_time
         if dt < 0:
             dt = 0.0
@@ -261,60 +262,43 @@ class Ball:
             dt = 1e-3
 
         F = np.array([
-            [1, 0, 0, dt, 0],
-            [0, 1, 0, 0, dt],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 1],
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
         ])
 
-        # Predição *sem alterar o filtro*
         x_pred = F @ self.kalman_state
+        theta_pred = float(np.arctan2(x_pred[3, 0], x_pred[2, 0]))  # vy, vx
 
-        return x_pred[0,0], x_pred[1,0], x_pred[2,0]
+        return x_pred[0, 0], x_pred[1, 0], theta_pred
 
-
-
+    # ======================================================================
+    # 🔹 ROI (com covariância propagada)
+    # ======================================================================
 
     def get_roi(self, image_shape, t_now, scale_std=3, min_size_cm=10.0):
         """
-        Retorna a janela de busca prevista pelo Kalman em coordenadas do MUNDO
-        VIRTUAL (cm): (x_cm, y_cm, w_cm, h_cm) — canto superior-esquerdo + dimensões.
-
-        Assinatura igual à de Robot.get_roi(image_shape, t_now): o detector
-        (PredictBall / DrawKalmanWindows) chama get_roi sem passar nenhum objeto de
-        sistema de visão e depois converte o resultado de cm para pixels através de
-        VisionSystem.GetRoiImg. Antes, este método pedia um `vision_sys` obrigatório
-        (usado só para projetar cm -> pixels "na mão") e devolvia pixels diretamente,
-        o que não batia com a forma como é chamado no resto do código — daí o erro.
-
-        A janela nunca é menor que min_size_cm x min_size_cm e cresce conforme a
-        incerteza (P) do filtro aumenta: quanto mais incerto o Kalman, maior a área
-        de busca devolvida.
+        Retorna a janela de busca em cm: (x, y, w, h) baseada na incerteza.
         """
         if not self.kalman_initialized or self.kalman_last_time is None:
-            # Sem Kalman inicializado ainda: usa a última posição conhecida com a
-            # janela mínima, centrada nela.
             x_pred, y_pred = float(self.position[0]), float(self.position[1])
             w_cm = h_cm = float(min_size_cm)
         else:
-            # --- 1) Posição predita pelo Kalman (em cm), sem alterar o filtro ---
             x_pred, y_pred, _ = self.predict(t_now)
 
-            # --- 2) Propagação da covariância (incerteza acumulada em dt), em cm ---
             dt = max(t_now - self.kalman_last_time, 0.0)
+            # Submatriz de posição/velocidade (índices 0,1,2,3)
             F_space = np.array([
                 [1, 0, dt, 0],
                 [0, 1, 0, dt],
                 [0, 0, 1, 0],
                 [0, 0, 0, 1]
             ])
-            # Isola submatrizes de posição/velocidade [x, y, vx, vy] da bola
-            P_sub = self.kalman_P[[0, 1, 3, 4], :][:, [0, 1, 3, 4]]
-            Q_sub = self.kalman_Q[[0, 1, 3, 4], :][:, [0, 1, 3, 4]]
+            P_sub = self.kalman_P  # já é 4x4
+            Q_sub = self.kalman_Q
             P_pred_space = F_space @ P_sub @ F_space.T + Q_sub
 
-            # Desvio-padrão da posição já em cm (estado do Kalman é em cm).
             std_x = float(np.sqrt(max(P_pred_space[0, 0], 0.0)))
             std_y = float(np.sqrt(max(P_pred_space[1, 1], 0.0)))
 
@@ -365,7 +349,7 @@ class Ball:
 
         self.kalman_initialized = False
         self.kalman_state[:] = 0
-        self.kalman_P = np.eye(5) * 500
+        self.kalman_P = np.eye(4) * 100.0
         self.kalman_last_time = None
 
         self.objLimit = Circle(Point2D(0, 0), 0)

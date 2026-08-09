@@ -1,25 +1,6 @@
 # ==========================================================================================
-# MÓDULO DE FUNÇÕES PARA ALGORÍTMO DE DETECÇÃO VSS (version v3.2)
-#==========================================================================================
-'''
-    @GNOMIO: Sismtea de detecção de objetos VSS (Vision System Soccer) versão 3.2.13   
-    
-    Versão: v3.3.22
-    Última modificação: 08/08/206
-    Autor: Saulo (update)
-
-    Patch Notes v3.3.22:
-    - Estou resolvendo a questão das colisões em que os blobs tem mais de um robô;
-    - Estou corrigindo a conexão com o filtro de KALMAN, para que esteja tudo bem sintonizado;
-    - Aguardo novas informações
-    - Modularizado o a função DetectPlayers em funções menores, facilitando a manutenção do código 
-      e replicar em outras partes.
-
-    Obs: Ainda está numa versão BETA, necessário testes para verificar se está
-    corretamente funcionando!!!
-
-'''
-#importando bibliotecas necessárias para o código
+# MÓDULO DE DETECÇÃO VSS (Vision System Soccer) -- v3.3.22 (BETA)
+# ==========================================================================================
 import cv2
 import numpy as np
 from timer import *
@@ -35,68 +16,30 @@ from modules.control.comm.protocols import common_pb2
 
 import traceback
 
-# ====================== DEFINIÇÕES DAS CLASSES DE OBJETO DO SISTEMA ==================
-#======================|| Sistema de detecção POO||======================================#
-#Classe principal do sistema de visão que irá executar as funções
+# ====================== SISTEMA DE VISÃO (VSS) ==================
 class VisionSystem:
-    '''
-    É a classe principal do sistema de visão. Ela é responsável por processar uma imagem
-    que pode vim de vários meios e extrair as informações pertinentes que serão utilizadas
-    no sistema de visão.
+    '''Processa a imagem da câmera e extrai bola/robôs/campo para o resto do sistema.'''
 
-    Ela funciona através de configurações enviadas pelo emulador, um objeto de captura e informar
-    se vai ou não utilziar a GPU para agilizar o processamento.
-    '''
-    #Inicializando objeto do sistema de detecção
     def __init__(self,config: EConfig = EConfig(), debug:bool = False, capture: Capture = None, UseCuda:bool = False, GPUType:GPUType = None):
-        '''
-            Inicializando o sistema de visão para realizar a captura de dados e tradução.
-            Para isso é necessário passar as configurações do emulador (EConfig), o objeto de captura
-            (capture) se ele tem ou não cuda  (useCuda) e qual o tipo de GPU (GPUType).
-        '''
-        #Configurando objetos
         self.CreateObjs()
-
         self._countProcess = 0
-
         self.bmk = Benchmark()
 
-        # ===============================================================================
-        # WATCHDOG CONFIG
-        self.MAX_MISSED_FRAMES_BALL = 10  # ~0.3s a 30fps
-        self.MAX_MISSED_FRAMES_ROBOT = 15 # Robôs tem mais inércia, toleramos mais
-        
-        # ESTADO
+        # Watchdog: nº de frames perdidos tolerados antes de resetar o Kalman
+        self.MAX_MISSED_FRAMES_BALL = 120 #2 segundos a 60 FPS e 4 segundos a 30FPS
+        self.MAX_MISSED_FRAMES_ROBOT = 120
         self.missed_frames_ball = 0
-        self.ball_kalman_reset_flag = False # Começa resetado
-        
-        # Para robôs, usamos um dicionário {robot_id: missed_count}
-        # Inicializa com 0 para todos os seus robôs (ex: 3 aliados, 3 inimigos)
-        self.missed_frames_robots = {} 
+        self.ball_kalman_reset_flag = False
+        self.missed_frames_robots = {}
         self.robot_kalman_reset_flags = {}
-        #+====================================================================================
 
-        # ===============================================================================
-        # GATING DE DISTÂNCIA (fail-safe compartilhado)
-        # Usado tanto por DetectPlayers (candidatos no frame inteiro) quanto por
-        # DetectBotInRoi/SearchBot (candidatos dentro da janela prevista pelo Kalman),
-        # para que as duas vias de detecção rejeitem candidatos igualmente implausíveis
-        # antes de alimentar o filtro.
-        self.MAX_JUMP_CM = 20.0
-        #+====================================================================================
+        # Gating de distância (fail-safe): rejeita saltos implausíveis antes do Kalman
+        self.MAX_JUMP_CM = 60.0
 
-        #variável que me dirá quantas vezes o sistema de visão foi chamado
-        self._count: int            = 0 
-        ''' Variável responsavel por dizer quantas vezes foi executado o sistema '''
-        self._firstTimeExec: int    = 0 
-        ''' Variável que diz quanto tempo se passou desde a primeira execução do código'''
-        #Carregando as configurações do sistema de visão
+        self._count: int            = 0
+        self._firstTimeExec: int    = 0
         self.config:EConfig    = config
-        
-        #objeto de captura internas
         self._capture:Capture  = capture
-
-        #verifica se existe suporte ao CUDA
         self._hasCuda           = UseCuda 
         self._GPUType           = GPUType
 
@@ -139,14 +82,6 @@ class VisionSystem:
         self.xnv     = 67                     
         self.ynv     = 402        
 
-        '''
-        @GNOMIO: Caso queira utilizar esses dados no FiraSIM, utilize esses
-        valores abaixo. Eles são do centro exato na imagem virtual (EM PIXELS!)
-        '''
-        #self.xnv = int(10*3+67+(150*3)/2)
-        #self.ynv = int(402 - 130*3/2)
-
-        #self.coordOrigin = np.array([67,402])
         self.coordOrigin = np.array([self.xnv,self.ynv])
 
         #variáveis de controle de tempo de execução
@@ -214,38 +149,24 @@ class VisionSystem:
 
 
 
-        #Variáveis internas do sistema de visão que serão importantes para o processamento
-        #Configurações
-        self.offSetWindow       = 10                 
-        '''Tamanho extra de janela utilizada'''
-        self.offSetErode        = 0                    
-        '''Quantidade padrão de erosões na imagem'''
-        self.dimMatrix          = 25                     
-        '''Dimensão da matriz de convolução na imagem'''
-        self.Thrashhold         = 235                   
-        '''Limiar de binarização da imagem'''
+        # Configurações gerais
+        self.offSetWindow       = 10                 # margem extra de janela
+        self.offSetErode        = 0                  # nº padrão de erosões
+        self.dimMatrix          = 25                 # dimensão da matriz de convolução
+        self.Thrashhold         = 235                # limiar de binarização
         self.pixelWidth         = 1
-        '''Tamanho de um pixel normal'''
 
-        #Imagens
-        self.frameOrigin        = None             
-        '''responsável por guardar a imagem do campo'''
-        self.ballImg            = None 
-        ''' Imagem da bola que é utilizada para processar e procurar os jogadores'''
-        self.fieldReduce        = None              
-        '''Imagem do campo reduzida'''
-        self.frameResult        = None              
-        '''Imagem final já reduzida e processada'''
-        self.imgReduce          = None              
-        '''Imagem reduzida para utilizar no processamento'''
-        self.binaryAllies      = None 
+        # Imagens
+        self.frameOrigin        = None
+        self.ballImg            = None
+        self.fieldReduce        = None
+        self.frameResult        = None
+        self.imgReduce          = None
+        self.binaryAllies       = None
+        self.binaryAllyConfirmed = None
 
-        # Definindo a binária para ser utilizada para guardar os robôs corretos
-        self.binaryAllyConfirmed = None 
-        
-        #Imagem virtual que será utilizada para o processamenot
         self.virtual            = cv2.imread("src/data/images/CampoVirtual.png")
-        self.virtualImg         = self.virtual.copy()   #As manipulações da imagem serão feitas nessa aqui
+        self.virtualImg         = self.virtual.copy()   # cópia manipulável
 
         #Imagens binarizadas utilizadas no código
         self.binaryObjects      = np.zeros((1, 1), dtype=np.uint8)              # Imagem binária dos objetos
@@ -330,22 +251,12 @@ class VisionSystem:
         self.BuildField()
     
     # ==========================================================================================
-    # BLOCO 1: MÉTODOS DE CONTROLE DA CLASSE (INICIALIZAÇÃO, CONFIGURAÇÃO E RESET)
+    # BLOCO 1: INICIALIZAÇÃO, CONFIGURAÇÃO E RESET
     # ==========================================================================================
-    #Inicializando os objetos do sistema
     def CreateObjs(self):
-        '''
-            @GNOMIO: função responsável por criar os objetos do sistema de visão.
-            Sendo eles a bola, os robôs, o campo e as áreas do campo.
-
-            Esses objetos são inicializados sem informação, e só são cadastrados dps
-        '''
-        #Construção dos objetos necessários para realizar a análise
-        #Objeto da bola
+        '''Cria os objetos do sistema (bola, robôs, campo) ainda sem dados cadastrados.'''
         self.ball = Ball()
-        
-        #Objeto dos robôs,
-        #robôs aliados
+
         self.robotAllyG = Robot(id=ID_Robots.ROBOT_ALLY_GOAL, team=ID_Team.TEAM_ALLY)
         self.robotAlly1 = Robot(id=ID_Robots.ROBOT_ALLY_1,team=ID_Team.TEAM_ALLY)
         self.robotAlly2 = Robot(id=ID_Robots.ROBOT_ALLY_2,team=ID_Team.TEAM_ALLY)
@@ -368,14 +279,8 @@ class VisionSystem:
         #gerando a viewCapture
         self.viewCapture = ViewCapture()
 
-    # atribuindo os valores dos pontos do campo
     def BuildField(self):
-        '''
-            Atribuindo os valores do campo que já foram carregados no campo
-
-            Necessário converter dados para cm e nas coordenadas de O' (xn,yn)
-        '''
-        #adicionando extremidades virtuais 
+        '''Converte os pontos fixos do campo virtual (pixels) para cm no sistema O' e monta o objeto Field.'''
         virtualExtrems = Quad(P1 = self.GetPointVirtual(Point2D(self.fieldP1v[0],self.fieldP1v[1])),
                               P2 = self.GetPointVirtual(Point2D(self.fieldP2v[0],self.fieldP2v[1])),
                               P3 = self.GetPointVirtual(Point2D(self.fieldP3v[0],self.fieldP3v[1])),
@@ -443,13 +348,9 @@ class VisionSystem:
         self.field.setAreaGoal(id=ID_Field.GOAL_ENEMY, rect=goalEnemy)
 
 
-    #extrair dados vindos do emulador 
     def ToMineData(self):
-        '''
-        Essa função extrai as informações vindas do Emulador no objeto EConfig.
-        '''
+        '''Extrai as configurações do objeto EConfig (emulador) para o sistema de visão.'''
         print("[VisionSystem]: Configurações carregadas")
-        #puxando valores do objeto de configuração
         self.offSetWindow   = self.config.offSetWindow  
         self.offSetErode    = self.config.offSetErode   
         self.dimMatrix      = self.config.dimMatrix     
@@ -491,27 +392,21 @@ class VisionSystem:
         self.iPPbSend     = self.config.ip_receive
         self.portPbSend   = self.config.port_receive
 
-        #Setando
         self.SetTreeColorDefault()
-        # Atribuindo cores a arvore da decisão
 
-    #definir novas configurações
     def SetConfigEmulator(self, config:EConfig):
-        '''
-            Essa função seta uma nova configuração para o sistema de visão pelo emulador
-        '''
+        '''Aplica uma nova configuração vinda do emulador.'''
         self.config = config
         self.ToMineData()
 
     def SetTreeColorDefault(self):
-        '''Setando configurações padrões da árvore de cores'''
-        # Time Aliado
+        '''Popula a ColorTree com as cores fixas dos aliados (time + primária + secundária).'''
         self.colorTree.add_robot(
-            ID_Team.TEAM_ALLY,      # time
-            ID_Robots.ROBOT_ALLY_GOAL,  # ID do robô
-            self.allyColor,         # cor principal do time
-            self.goalAllyColor1,    # cor primária do robô
-            self.goalAllyColor2     # cor secundária do robô
+            ID_Team.TEAM_ALLY,
+            ID_Robots.ROBOT_ALLY_GOAL,
+            self.allyColor,
+            self.goalAllyColor1,
+            self.goalAllyColor2
         )
         
         self.colorTree.add_robot(
@@ -539,21 +434,14 @@ class VisionSystem:
         #     self.goalEnemyColor2
         # )
     
-    #método para retornar o processamento
     def GetViewCapture(self):
-        '''
-            Retorna a janela de interesse do sistema de visão
-        '''
+        '''Retorna a janela de interesse (ROI) do sistema de visão.'''
         return self.viewCapture
-    
-    #definindo modo para resetar configurações
+
     def ResetVs(self):
-        """Reset COMPLETO do sistema de visão"""
-        
-        # 1. Recria objetos principais
+        '''Reset completo: objetos, estado, homografia, buffers e imagens.'''
         self.CreateObjs()
-        
-        # 2. Reset de TODAS as variáveis de estado
+
         self._countProcess = 0
         self._count = 0
         self._firstTimeExec = 0
@@ -561,27 +449,23 @@ class VisionSystem:
         self.currentTime = 0
         self.dT = 0
 
-        # Salva caches dos inimigos
         self._enemy_last_pos = {}
         self._ally_last_pos = {}
 
-        # 3. Reset de transformações
         self.homography_matrix = None
         self.inv_homography_matrix = None
         self.prop_px_cm = 1
         self.min_diag = (7.5 / 4) * np.sqrt(2) * self.prop_px_cm
-        
-        # 4. Reset de configurações de GPU/CPU
+
         self.GPUimg = None
         self.CPUimg = None
         self.emulatorMode = MODE_IMAGE
-        
-        # 5. Reset de imagens e buffers
+
         self.frameOrigin = None
         self.ballImg = None
         self.fieldReduce = None
         self.frameResult = None
-        
+
         self.ResetExecutionState()
         
         # 7. Reconstroi o campo
@@ -591,73 +475,49 @@ class VisionSystem:
         self.SetTreeColorDefault()
 
     def ResetExecutionState(self):
-        """
-        Reseta apenas variáveis temporárias entre execuções do processamento.
-        Preserva dados dos robôs, bola, campo e configurações permanentes.
-        
-        Deve ser chamado APÓS cada Proc() completo para limpar estado interno.
-        """
-        # ==================== IMAGENS TEMPORÁRIAS ====================
+        '''Reseta variáveis temporárias entre frames (preserva robôs/bola/campo/config). Chamar após cada Proc().'''
         self.frameOrigin = None
         self.fieldReduce = None
         self.frameResult = None
         self.imgReduce = None
         self.ballImg = None
-        
-        # ==================== IMAGENS BINÁRIAS ====================
+
         self.binaryObjects = np.zeros((1, 1), dtype=np.uint8)
         self.binaryPlayers = np.zeros((1, 1), dtype=np.uint8)
         self.binaryBall = np.zeros((1, 1), dtype=np.uint8)
         self.binReduceField = np.zeros((1, 1), dtype=np.uint8)
         self.binField = np.zeros((1, 1), dtype=np.uint8)
         self.binaryAllies = np.zeros((1, 1), dtype=np.uint8)
-        
-        # ==================== BUFFERS DE PROCESSAMENTO ====================
+
         self.playersWindows = [None, None, None, None, None, None]
         self.alliesWindows = [None, None, None]
         self.enimiesWindows = [None, None, None]
-        
-        # ==================== CONTADORES TEMPORÁRIOS ====================
+
         self.playersCount = 0
         self.alliesCount = 0
         self.enemiesCount = 0
         self.fieldDetectionFailCount  = 0
-        # ==================== ESTADO DE DETECÇÃO ATUAL ====================
-        # Reset apenas dos flags de detecção do frame atual
-        # (não afeta histórico de posições)
+
+        # Flags de detecção do frame atual (não mexe no histórico de posições)
         for bot in self.allyTeam:
-            bot.detected = False  # Apenas o status de detecção atual
-            bot.possessionBall = False  # Posse de bola é temporária
-            
+            bot.detected = False
+            bot.possessionBall = False
         for bot in self.enemyTeam:
             bot.detected = False
             bot.possessionBall = False
-            
         if hasattr(self.ball, 'detected'):
             self.ball.detected = False
-        
-        # ==================== VARIÁVEIS DE TEMPO DO FRAME ====================
-        # Não resetar: self.lastMajorTime, self.currentTime, self.dT
-        # (são necessárias para controle temporal entre execuções)
-        
-        # ==================== RESET DA IMAGEM VIRTUAL ====================
+
         if hasattr(self, 'virtual'):
             self.virtualImg = self.virtual.copy()
-        
-        # ==================== LIMPEZA DE THREADS FINALIZADAS ====================
-        # Limpa threads que já terminaram, mantém executor ativo
+
         self._threads = [t for t in self._threads if t.is_alive()]
-        
-        # Reseta a árvore de cores
+
         self.colorTree.clear()
         self.SetTreeColorDefault()
 
     def GetObjects(self):
-        '''
-            Função responsável por retornar os objetos do sistema de visão
-
-        '''
-        #construindo dicionário com os objetos 
+        '''Retorna dict com aliados, inimigos, bola, campo e timestamp.'''
         objects = {
             ID_Objects.ALLIES:self.allyTeam,
             ID_Objects.ENEMIES: self.enemyTeam,
@@ -669,33 +529,22 @@ class VisionSystem:
         return objects 
     
     def GetFrameProtobuff(self):
-        """
-        Gera o pacote Protobuf (Frame) com dados filtrados pelo Kalman.
-        Realiza a conversão de unidades (cm -> m) e de cinemática (Rodas -> Global).
-        """
+        '''Gera o pacote Protobuf (Frame) com dados filtrados pelo Kalman, convertendo cm->m e rodas->velocidade global.'''
         frame = common_pb2.Frame()
 
-        # =========================================================================
-        # 1. BOLA (Estado: x, y, theta, vx, vy)
-        # =========================================================================
+        # --- Bola: posição/velocidade filtradas (cm -> m) ---
         if self.ball is not None:
             try:
-                # --- Posição ---
-                # Prioriza o valor filtrado se disponível
                 if hasattr(self.ball, 'position_filtered') and self.ball.position_filtered is not None:
                     bx, by = self.ball.position_filtered
                 else:
                     bx, by = self.ball.position
-                
-                # --- Velocidade ---
-                # Se a bola tem Kalman, o estado já é [vx, vy]
+
                 bvx, bvy = 0.0, 0.0
                 if hasattr(self.ball, 'velocity_filtered') and self.ball.velocity_filtered is not None:
-                    # Assume que o filtro da bola retorna [vx, vy] diretamente
                     vel = self.ball.velocity_filtered
                     bvx, bvy = vel[0], vel[1]
-                
-                # Preenchimento (Convertendo cm -> metros)
+
                 frame.ball.x = float(bx) / 100.0
                 frame.ball.y = float(by) / 100.0
                 frame.ball.z = 0.0
@@ -705,48 +554,28 @@ class VisionSystem:
             except Exception as e:
                 if self.debug: print(f"[VS] Erro Bola Protobuff: {e}")
 
-        # =========================================================================
-        # 2. HELPER: ROBÔS (Estado: x, y, theta, vL, vR, omega)
-        # =========================================================================
         def fill_robot_proto(source_bot, proto_bot):
-            # --- Posição e Orientação ---
-            # O @property position_filtered já trata se o Kalman está init ou não
+            # Kalman guarda [x, y, th, vL, vR, w]; protobuf quer [vx, vy] global
             rx, ry = source_bot.position_filtered
-            r_theta = source_bot.theta_filtered # Radianos
+            r_theta = source_bot.theta_filtered
 
-            # --- Velocidade (O Pulo do Gato) ---
-            # O estado do seu Kalman é [x, y, th, vL, vR, w]
-            # O Protobuf quer [vx, vy] (Global)
-            
-            v_wheels = source_bot.velocity_filtered # Retorna np.array([vL, vR])
-            vL = v_wheels[0]
-            vR = v_wheels[1]
+            v_wheels = source_bot.velocity_filtered
+            vL, vR = v_wheels[0], v_wheels[1]
             r_omega = source_bot.omega_filtered
 
-            # Conversão: Cinemática Diferencial -> Velocidade Linear Global
-            # V_linear_robô = (vR + vL) / 2
-            v_lin = (vR + vL) / 2.0
-
-            # Projeção no eixo global (X, Y)
+            v_lin = (vR + vL) / 2.0  # cinemática diferencial -> linear
             r_vx = v_lin * np.cos(r_theta)
             r_vy = v_lin * np.sin(r_theta)
 
-            # --- Preenchimento do Pacote (cm -> m) ---
             proto_bot.robot_id = int(source_bot.id.value) if hasattr(source_bot.id, 'value') else int(source_bot.id)
             proto_bot.x = float(rx) / 100.0
             proto_bot.y = float(ry) / 100.0
             proto_bot.orientation = float(r_theta)
-            
-            # Velocidades convertidas
             proto_bot.vx = float(r_vx) / 100.0
             proto_bot.vy = float(r_vy) / 100.0
             proto_bot.vorientation = float(r_omega)
 
-        # =========================================================================
-        # 3. POPULANDO OS ROBÔS
-        # =========================================================================
-        
-        # Time Aliado -> Yellow (Seguindo sua convenção)
+        # Aliado -> yellow, Inimigo -> blue
         if self.allyTeam:
             for robot in self.allyTeam:
                 if robot is not None and robot.detected:
@@ -769,18 +598,14 @@ class VisionSystem:
         return frame
 
     def GetBotById(self, team:ID_Team, bot_id:ID_Robots) -> Robot:
-        '''
-            retorna o robô por meio do identificador e do time.
-        '''
+        '''Retorna o robô pelo time + ID.'''
         if team == ID_Team.TEAM_ALLY:
             return self.allyTeam[bot_id]
         else:
             return self.enemyTeam[bot_id]
-            
+
     def MatchesRobot(self, bot: Robot, primary, secondary) -> bool:
-        """
-        Verifica se a combinação de cores detectada corresponde ao robô esperado.
-        """
+        '''Verifica se a combinação de cores detectada corresponde ao robô esperado.'''
         team = bot.team
         robot_id = bot.id
         main_color = bot.colorTeam
@@ -802,153 +627,76 @@ class VisionSystem:
         return img.shape[:2]
 
     def CheckFieldReset(self):
-        """
-        Verifica se houve muitas falhas consecutivas na detecção do campo
-        e executa um reset completo se necessário.
-        """
+        '''Se houve falhas consecutivas demais na detecção do campo, reseta robôs, bola e homografia.'''
         if self.fieldDetectionFailCount >= self.maxFieldFailures:
             print(f"[VisionSystem] RESET: {self.fieldDetectionFailCount} falhas consecutivas na detecção do campo")
-            
-            # Reset completo de todos os objetos
             for bot in (*self.allyTeam, *self.enemyTeam):
-                bot.reset()  # Reset completo (incluindo Kalman)
-                
+                bot.reset()
             if hasattr(self, "ball"):
                 self.ball.reset()
-                
-            # Reset de transformações e configurações
+
             self.homography_matrix = None
             self.inv_homography_matrix = None
             self.fieldDetectedFlag = False
-            
-            # Reset do contador (opcional - ou manter para evitar reset contínuo)
-            self.fieldDetectionFailCount = 0  # Reset para evitar múltiplos resets
-            
+            self.fieldDetectionFailCount = 0
+
             if self.debug:
                 print("[FIELD_RESET] Sistema resetado devido a falhas persistentes na detecção do campo")
-                
 
     # ==========================================================================================
-    # BLOCO 2: FUNÇÕES AUXILIARES (PROCESSAMENTO DE IMAGEM, CORES, DESENHO E UTILITÁRIOS)
+    # BLOCO 2: PROCESSAMENTO DE IMAGEM, CORES, DESENHO E UTILITÁRIOS
     # ==========================================================================================
-    
-    #puxando imagem
     def LoadImage(self, imgPath):
-        '''
-            Função que carrega imagem na CPU por meio de um caminho (imgPath). Sem usar a GPU
-        '''
-        self.imgOrigim = cv2.imread(imgPath) 
-    
-    #transformando imagem em tons de cinza
+        '''Carrega imagem do disco (CPU).'''
+        self.imgOrigim = cv2.imread(imgPath)
+
     def GrayScale(self,img):
-        '''
-            Coloca a imagem passada em tons de cinza, Sem usar a GPU
-        '''
+        '''Converte para tons de cinza.'''
         return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    
-    #aplicando o filtro mediana para possíveis ruídos
+
     def MedianBlur(self, img, kernelSize = 3):
-        '''
-            Aplica o filtro de mediana para reduzir ruídos. Sem usar a GPU.
-        '''
+        '''Filtro de mediana para reduzir ruído.'''
         return cv2.medianBlur(img, kernelSize)
-    
-    #binarizando a imagem indo de um limir até 255
+
     def BinarizeUp(self, img, threshold=150):
-        '''
-            Binariza a imagem por meio de um threshold, ou seja, um limiar
-            de intensidade dos pixels. Para isso, a imagem tem que estar em
-            tons de cinza. Tratada pela função MedianBlur().
-        '''
+        '''Binariza a imagem (em tons de cinza) por threshold.'''
         _,bin = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY)
         return bin
 
-    #trata ruídos da imagem binarizada
     def TraitNoise(self, binImg, it=1):
-        """
-        Reduz ruídos em imagens binarizadas.
-
-        Parâmetros:
-            binImg (np.ndarray): imagem binarizada (grayscale ou binária 0/255).
-            it (int): número de iterações de erosão/dilatação (default = 1).
-
-        Retorna:
-            np.ndarray: imagem binarizada com menos ruído.
-        """
+        '''Remove ruído de uma imagem binarizada (abertura + fechamento morfológicos).'''
         try:
-            # Garante tipo binário
             if binImg.dtype != np.uint8:
                 binImg = cv2.convertScaleAbs(binImg)
-
-            # Estrutura cruzada pequena remove ruídos pontuais sem deformar objetos
             kernel = self.kernel_morph
-
-            # Erosão seguida de dilatação = abertura morfológica (remove ruídos brancos)
             binImgProc = cv2.morphologyEx(binImg, cv2.MORPH_OPEN, kernel, iterations=it)
-
-            # (Opcional) fechamento remove buracos pequenos dentro dos objetos
             binImgProc = cv2.morphologyEx(binImgProc, cv2.MORPH_CLOSE, kernel, iterations=max(1, it - 1))
-
             return binImgProc
-
         except Exception as e:
             print(f"[SystemVision][TRAIT_NOISE]: Erro ao tratar ruído — {e}")
             return binImg
 
-    #recuperando objeto de maior área
     def GetObject(self,img):
-        '''
-            Retorna o maior contorno encontrado ou None se não houver contornos.
-        '''
+        '''Retorna o maior contorno da imagem, ou None.'''
         contours, _ = cv2.findContours(img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
         return max(contours, key=cv2.contourArea)
-    
-    #recuperando coordenadas extremas que englobam o objeto maior 
+
     def GetPerspective(self, contour):
-        """
-        Retorna as coordenadas (x1, y1, x2, y2) do retângulo delimitador
-        do contorno fornecido.
-
-        Parâmetros:
-            contour (np.ndarray): contorno do objeto (como retornado por cv2.findContours).
-
-        Retorna:
-            tuple[int, int, int, int] | None:
-                (x1, y1, x2, y2) → coordenadas dos cantos do retângulo.
-                Retorna None se o contorno for inválido ou vazio.
-        """
-        # Verifica se o contorno é válido e não vazio
+        '''Retorna (x1, y1, x2, y2) do retângulo delimitador do contorno, ou None se inválido.'''
         if contour is None or len(contour) == 0:
             return None
-
-        # Garante que o contorno tenha o formato adequado
         contour = np.array(contour).astype(np.int32)
-
-        # Obtém o retângulo delimitador
         x, y, w, h = cv2.boundingRect(contour)
-
-        # Retorna coordenadas absolutas (x1, y1, x2, y2)
         return x, y, x + w, y + h
     
     def HighlightImg(self, img, dim=25):
-        """
-        Realça objetos brilhantes em uma imagem em tons de cinza.
-
-        Parâmetros:
-            img (np.ndarray): imagem de entrada em escala de cinza.
-            dim (int): tamanho do elemento estruturante para o rea00lce (default = 25).
-
-        Retorna:
-            np.ndarray: imagem realçada.
-        """
+        '''Realça objetos brilhantes em imagem em tons de cinza (top-hat morfológico).'''
         try:
-            # Garante que a imagem esteja em escala de cinza
             if len(img.shape) == 3:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # Cria elemento estruturante elíptico (suave)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dim, dim))
 
             # Top-hat: realça áreas mais brilhantes que o entorno
@@ -966,20 +714,8 @@ class VisionSystem:
             print(f"[SystemVision][HIGHLIGHT_IMG]: Erro ao realçar imagem — {e}")
             return img
 
-    #função para reduzir a imagem original
     def ReduceWindow(self, img, coorVetor, d=10):
-        """
-        Reduz a imagem para uma subjanela baseada nas coordenadas (x, y, w, h)
-        aplicando uma leve transformação de perspectiva.
-
-        Parâmetros:
-            img (np.ndarray): imagem original.
-            coorVetor (list | tuple): [x, y, w, h] delimitando a janela.
-            d (int): margem adicional em pixels (default = 10).
-
-        Retorna:
-            np.ndarray: imagem reduzida (ou original, em caso de erro).
-        """
+        '''Recorta `img` na subjanela [x,y,w,h] (+ margem `d`) via transformação de perspectiva.'''
         try:
             x, y, w, h = map(int, coorVetor)
 
@@ -1021,13 +757,8 @@ class VisionSystem:
             print(f"[SystemVision][REDUCE_WINDOW]: Erro ao reduzir janela — {e}")
             return img
    
-    #função responsável para reduzir a imagem para os contornos do campo
     def ReduceField(self, BinImg, Img, fieldWidth, d=10):
-        """
-        Reduz a imagem para a região do maior contorno (campo).
-        """
-
-        # Buscar contornos externos
+        '''Recorta BinImg/Img para o bounding box do maior contorno (o campo), com margem `d`.'''
         contours, _ = cv2.findContours(BinImg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             print("[SystemVision]/[REDUCE_FIELD]: Nenhum contorno encontrado.")
@@ -1084,21 +815,13 @@ class VisionSystem:
 
         return bin_Reduce, img_Reduce, cooVetor
 
-    #função para converter medidas
     def ConvertMeasures(self, w_cm, w_px):
-        '''
-            Ajusto a constante de proporcionaldiade de px para cm. 
-            Representada pela variável: prop_px_cm
-        '''
-        #atualizando proporções para realizar os devidos cálculos
+        '''Atualiza a proporção px/cm (self.prop_px_cm) usada em todo o pipeline.'''
         self.prop_px_cm = w_px / w_cm
         self.min_diag = (7.5 / 4) * np.sqrt(2) * self.prop_px_cm
 
-    #função para listar os jogadores
     def ListPlayers(self, teamList):
-        '''
-            Simplesmente lista os jogadores detectados
-        '''
+        '''Imprime os jogadores de um time (debug).'''
         amount = len(teamList)
         for i in range(amount):
             print(teamList[i].team, teamList[i].id)
@@ -1106,20 +829,12 @@ class VisionSystem:
         
         print("====================")
 
-    #puxando intervalos de cores
     def CreateColorBounds(self, color_array, hue_tolerance=10,
                             saturation_tolerance=50, value_tolerance=50):
         '''
-            Cria as bandas inferior e superior em HSV por meio de um array
-            que passa a informação em HSV dada pelo usuário.
-
-            O Hue é tratado com wrap circular (módulo 180, padrão do OpenCV): para
-            cores próximas do 0/179 (ex: vermelho) o limite inferior pode ficar MAIOR
-            que o superior, indicando um intervalo que cruza o 0°. Consumidores devem
-            tratar esse caso:
-              - ColorInRange() já lida com o wrap (lower[0] > upper[0]).
-              - para cv2.inRange, use self.MaskInRange() (que divide em dois
-                intervalos e faz OR), pois cv2.inRange sozinho não suporta wrap.
+        Cria bandas inferior/superior em HSV a partir de uma cor central.
+        Hue usa wrap circular (mod 180): se lower[0] > upper[0], o intervalo cruza o 0°
+        -- use MaskInRange() (não cv2.inRange puro) para tratar isso.
         '''
         h = int(color_array[0]) % 180
         s = int(color_array[1])
@@ -1158,29 +873,13 @@ class VisionSystem:
         return cv2.bitwise_or(m1, m2)
     
     def UpSaturation(self, img, boost: int = 50):
-        """
-        Aumenta a saturação de uma imagem BGR.
-        
-        Parâmetros:
-            img (np.ndarray): imagem em formato BGR.
-            boost (int): valor a adicionar à saturação (padrão: +50).
-        
-        Retorna:
-            np.ndarray: imagem com saturação aumentada.
-        """
-        # Converte para HSV
+        '''Aumenta a saturação (canal S) de uma imagem BGR em `boost`.'''
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        # Aumenta o canal de saturação (S) de forma vetorizada
         hsv[..., 1] = np.clip(hsv[..., 1].astype(np.int16) + boost, 0, 255).astype(np.uint8)
-
-        # Converte de volta para BGR
         return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
     def FindBinaryContours(self, image, lower_bound, upper_bound):
-        '''
-        Encontra contornos na imagem capturada filtrando com HSV
-        '''
+        '''Encontra contornos filtrando a imagem por faixa HSV.'''
         lower = np.array(lower_bound)
         upper = np.array(upper_bound)
 
@@ -1204,33 +903,15 @@ class VisionSystem:
 
         return contours
     
-    #sort values
     def SortPoints(self, points):
-        # Ordena os pontos primeiro pelo y (crescente) e depois pelo x (crescente)
+        '''Ordena 4 pontos como [top_right, top_left, bottom_left, bottom_right].'''
         points = sorted(points, key=lambda p: (p[1], p[0]))
-        
-        # Identificar os dois pontos superiores e os dois pontos inferiores
-        top_points = points[:2]
-        bottom_points = points[2:]
-        
-        # Ordenar os pontos superiores por x (crescente)
-        top_points = sorted(top_points, key=lambda p: p[0])
-        
-        # Ordenar os pontos inferiores por x (crescente)
-        bottom_points = sorted(bottom_points, key=lambda p: p[0])
-        
-        # Retornar os pontos na ordem desejada: [top_right, top_left, bottom_left, bottom_right]
-        sorted_points = np.array([top_points[0], top_points[1], bottom_points[1], bottom_points[0]], dtype=np.int32)
-        
-        return sorted_points
+        top_points = sorted(points[:2], key=lambda p: p[0])
+        bottom_points = sorted(points[2:], key=lambda p: p[0])
+        return np.array([top_points[0], top_points[1], bottom_points[1], bottom_points[0]], dtype=np.int32)
 
     def DetectSquares(self,img_bin, min_diag=20):
-        """
-        Processa uma imagem binarizada e retorna apenas os objetos com formato próximo de quadrado.
-        Retorna:
-            - bin_res: imagem binarizada com apenas os quadrados;
-            - contours_treat: lista de contornos correspondentes aos quadrados.
-        """
+        '''Filtra uma imagem binarizada, mantendo só os contornos com formato de quadrado.'''
         contours, _ = cv2.findContours(img_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return img_bin, []
@@ -1252,19 +933,14 @@ class VisionSystem:
             return None
 
     # ==========================================================================================
-    # BLOCO 3: FUNÇÕES DE DESENHO E DEBUG (NÃO AFETAM A LÓGICA DE DETECÇÃO)
+    # BLOCO 3: DESENHO E DEBUG (não afeta a lógica de detecção)
     # ==========================================================================================
-    
-    #Desenhar circulos na imagem onde estão os jogadores
     def DrawPlayerCircle(self, imgDegub, robot:Robot):
-        '''
-            Desenha um círculo no jogador
-        '''
+        '''Desenha o círculo + rótulo (time/ID) de um robô.'''
         xi = int(robot.xi)
         yi = int(robot.yi)
         ri = int(robot.ri)
 
-        #Configurando prints
         if robot.team == ID_Team.TEAM_ALLY:
             team = "A"
             color = (255,0,0)
@@ -1524,21 +1200,11 @@ class VisionSystem:
     # ==========================================================================================
 
     #função para retornar homografia entre dois sistemas de pontos
+    
     def GetHomographyMatrix(self, ptsSrc, ptsFinal):
         '''
-            Essa função retorna a matrix 3x3 de homografia entre dois planos
-            nesse caso, a imagem de detecção e uma imagem virtual. Nesse caso, a matrix vai mapear os pontos de entrada nos pontos de saída.
-
-            Obs: A imagem de saída tem as dimensões de 645 por 413 px, e a proporção px/cm = 3
-            Além disso, já foi configurado para esse calculo ser realizado com os pontos extremos do campo.
-
-            Essa matrix fica salva no sistema de visão para poder realizar as devidas operações
-            
-            ### Variáveis
-            - ptsSrc: conjunto de quatro pontos de entrada da imagem original
-            - ptsFinal: Conjunto de pontos correspondentes na imagem final
-
-            # Necessário que essas variáveis sejam vetores array.
+        Calcula e salva a homografia 3x3 (imagem real -> imagem virtual, 645x413px, 3px/cm)
+        a partir de 4 pontos correspondentes, e sua inversa.
         '''
         ptsSrc = np.array(ptsSrc, dtype='float32')
         ptsFinal = np.array(ptsFinal, dtype='float32')
@@ -1548,76 +1214,38 @@ class VisionSystem:
         if self.homography_matrix is not None and np.linalg.cond(self.homography_matrix) < 1 / np.finfo(self.homography_matrix.dtype).eps:
             self.inv_homography_matrix  =   np.linalg.inv(self.homography_matrix)
         else:
-            # A matriz de homografia é singular e não pode ser invertida
-            self.inv_homography_matrix = np.eye(3)  # Matriz identidade 3x3
+            self.inv_homography_matrix = np.eye(3)
             print("[ERROR]: Matriz de homografia singular e foi substituída por uma matriz identidade.")
 
-    #Transformar valores 
     def TransformPoint(self, ptSrc):
-        '''
-            Ela utiliza a matrix de homografia para transformar um ponto da imagem original num ponto da imagem
-            virtual. Realizando essa conversão é possível saber uma boa aproximação, e desconsidera as distorções.
-        '''
-
+        '''Aplica a homografia: ponto na imagem real -> ponto na imagem virtual.'''
         ptSrc = np.array([[[ptSrc[0], ptSrc[1]]]], dtype=np.float32)
         ponto_transformado = cv2.perspectiveTransform(ptSrc, self.homography_matrix)
         return ponto_transformado[0][0]
 
-    #aplica transformação inversa no ponto para recuperar o valor
     def InvTransformPoint(self, ptSrc):
-        '''
-            Realiza o trabalho inverso no TransformPoint, retornando para o espaço original da imagem.
-        '''
+        '''Inverso de TransformPoint: imagem virtual -> imagem real.'''
         ptSrc = np.array([[[ptSrc[0], ptSrc[1]]]], dtype=np.float32)
         ponto_transformado = cv2.perspectiveTransform(ptSrc, self.inv_homography_matrix)
         return ponto_transformado[0][0]
-        
-    #Passa os indices da matrix final e transforma em valores em cm
+
     def GetPointVirtual(self, ptSrc):
-        '''
-            Com o "ptSrc" da imagem virtual é encontrado sua posição em relação ao
-            novo sistema de coordenadas O', esse valor em cm será o que será guardado nos objetos
-            (bola, robô e campo). Assim será possível realizar os calculos apenas no mundo virtual
-
-            Deve-se passar o índice correspondente a imagem virtualizada e ele retorna
-            a posição com cm (m/100)
-
-            O resultado é um ponto em centímetros (cm)
-        '''
-
-        #   transforma o ponto no novo sistema de coordenadas
-        
+        '''Converte um ponto (pixel) da imagem virtual para cm no sistema de coordenadas O'.'''
         x = ptSrc[0]
         y = ptSrc[1]
-
-        #   coordenada final
         x_f = (x - self.xnv)/3
         y_f = (self.ynv - y)/3
-
-        #caso a função seja utilizada num objeto Point2D, ela funciona assim:
         return x_f,y_f
 
-    #com a posição em O' (em cm), transforma num índice na imagem:
     def GetImageIndice(self,ptSrc):
-        '''
-            Pega o valor do ponto em cm, e transforma em índices para a imagem virtual
-            para poder, então desenhar-lo.
-        '''
+        '''Converte um ponto em cm (O') para pixel na imagem virtual.'''
         x_f =int(ptSrc[0]*3 +self.xnv)
         y_f = int(self.ynv-ptSrc[1]*3)
-
         return x_f, y_f
 
-    #definindo uma função para retornar a coordenada na imagem reduzida
     def GetImageRealIndice(self, ptSrc):
-        '''
-            Esse método pega as coordenadas virtuais em O' e passa retorna para os indices da imagem real.
-        '''
-        #pego os valores dos indices na imagem virtual
+        '''Converte um ponto em cm (O') direto para pixel na imagem real (GetImageIndice + InvTransformPoint).'''
         x_i, y_i = self.GetImageIndice(ptSrc)
-    
-        #pego os valores dos indices na imagem virtual e aplica a homografia inversa
-        #retornando a imagem reduzida
         return self.InvTransformPoint([x_i, y_i])
 
     def IsSquare(self, contour, min_diag=20):
@@ -1882,47 +1510,26 @@ class VisionSystem:
         return mean_hsv
     
     def Hsv2Bgr(self, color_hsv):
-        '''
-            Converte HSV para BGR
-        '''
-        hsv_pixel = np.uint8([[color_hsv]])   # shape (1,1,3)
+        '''Converte uma cor HSV para BGR.'''
+        hsv_pixel = np.uint8([[color_hsv]])
         bgr_pixel = cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2BGR)
         return tuple(int(c) for c in bgr_pixel[0,0])
 
     def ColorInRange(self, hsv_values, lower, upper):
-        """
-        Verifica se uma ou várias cores HSV estão dentro da faixa especificada.
-        Suporta faixas que cruzam o limite do Hue (ex: vermelho 170–10).
-
-        Parâmetros:
-            hsv_values : np.ndarray
-                Cor única [H, S, V] ou matriz Nx3 com várias cores HSV.
-            lower : iterable
-                Limite inferior [H, S, V].
-            upper : iterable
-                Limite superior [H, S, V].
-
-        Retorna:
-            np.ndarray (bool) se hsv_values for Nx3, ou bool se for [3]
-        """
+        '''Verifica se cor(es) HSV [Nx3 ou N] estão na faixa [lower,upper], tratando wrap do Hue.'''
         hsv_values = np.atleast_2d(hsv_values).astype(np.uint16)
         lower = np.array(lower, dtype=np.uint16)
         upper = np.array(upper, dtype=np.uint16)
 
-        # --- caso em que faixa cruza o 0° do Hue (ex: 170–10)
-        if lower[0] > upper[0]:
+        if lower[0] > upper[0]:  # faixa cruza o 0° do Hue
             mask_hue = ((hsv_values[:, 0] >= lower[0]) | (hsv_values[:, 0] <= upper[0]))
         else:
             mask_hue = ((hsv_values[:, 0] >= lower[0]) & (hsv_values[:, 0] <= upper[0]))
 
-        # --- máscaras para S e V (sempre diretas)
         mask_sat = ((hsv_values[:, 1] >= lower[1]) & (hsv_values[:, 1] <= upper[1]))
         mask_val = ((hsv_values[:, 2] >= lower[2]) & (hsv_values[:, 2] <= upper[2]))
-
-        # Combina tudo
         mask = mask_hue & mask_sat & mask_val
 
-        # Retorna booleano simples se foi entrada única
         return mask[0] if hsv_values.shape[0] == 1 else mask
 
     def IsColorMatch(self, measured_hsv, target_hsv):
@@ -2163,118 +1770,52 @@ class VisionSystem:
             self.ball.status = False
 
     def DetectPlayers(self, img, timestamp, dbg=False, isT=False, hsv_img=None):
-        """
-        Detecta robôs na imagem. Orquestra as 3 partes reutilizáveis em que a
-        detecção foi modularizada (ver blocos abaixo):
-
-            PARTE 1 -> DetectPlayerCandidates   (motor de detecção de candidatos,
-                                                  reutilizável em janelas de
-                                                  qualquer tamanho)
-            PARTE 2 -> ResolveCollisionBlob      (tratamento de blobs "gigantes",
-                                                  chamada internamente pela
-                                                  Parte 1 quando um contorno é
-                                                  grande demais para 1 robô só)
-            PARTE 3 -> AssociatePlayerCandidates (identificação do candidato
-                                                  como um robô específico +
-                                                  atualização do filtro de
-                                                  Kalman de cada robô)
-
-        A lógica interna de cada etapa é EXATAMENTE a mesma de antes (mesmos
-        limiares, mesma ordem de operações, mesma regra de
-        setPosition/updatePosition do Kalman) -- só a organização em funções
-        mudou, para permitir:
-          (a) reaproveitar a Parte 1 (detecção) em janelas menores que o campo
-              inteiro (ex.: uma ROI específica), via os parâmetros
-              x_offset/y_offset;
-          (b) isolar e evoluir com segurança o tratamento de colisões (Parte 2)
-              sem mexer no resto;
-          (c) evoluir a identificação por cor (Parte 3) -- inclusive estender
-              para os aliados a mesma checagem via árvore de cores
-              (self.colorTree) já usada para os inimigos -- sem tocar em
-              detecção/blob.
-        """
-        # =========== 1. Preparação Usa o HSV Global ===================
-        if hsv_img is not None:
-            imgHSV = hsv_img
-        else:
-            imgHSV = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        '''
+        Detecta robôs no frame inteiro. Orquestra:
+          PARTE 1 -> DetectPlayerCandidates   (gera candidatos "crus")
+          PARTE 2 -> ResolveCollisionBlob     (separa blobs fundidos, chamada pela Parte 1)
+          PARTE 3 -> AssociatePlayerCandidates (identifica o ID de cada candidato + Kalman)
+        '''
+        imgHSV = hsv_img if hsv_img is not None else cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         debug = dbg
 
-        # Cache de últimas posições conhecidas (persiste entre frames).
         if not hasattr(self, "_enemy_last_pos"):
-            self._enemy_last_pos = {}   # {slot_idx (0,1,2): (xcm, ycm)}
+            self._enemy_last_pos = {}   # {slot: (xcm, ycm)}
         if not hasattr(self, "_ally_last_pos"):
-            self._ally_last_pos = {}    # {bot_id (ID_Robots): (xcm, ycm)}
-        # Reset de contadores e status
+            self._ally_last_pos = {}    # {bot_id: (xcm, ycm)}
+
         self.playersCount = self.enemiesCount = self.alliesCount = 0
         for bot in (*self.enemyTeam, *self.allyTeam):
             bot.setStatus(False)
 
-        # Mantido só para compatibilidade com qualquer uso externo de
-        # para decidir candidatos.
         self.binaryPlayers = np.zeros(img.shape[:2], dtype=np.uint8)
         self.binaryAllies = np.zeros(img.shape[:2], dtype=np.uint8)
 
-        # =========== PARTE 1 (+ PARTE 2 internamente p/ colisões) =========
-        # x_offset/y_offset = 0 porque aqui `img` JÁ É o referencial global
-        # (o campo inteiro). Para reaproveitar em uma janela menor, chame
-        # DetectPlayerCandidates diretamente com a janela recortada e o
-        # deslocamento (x0, y0) dela dentro do campo -- ver docstring do
-        # método para os detalhes do referencial de coordenadas.
+        # offset (0,0): `img` já é o referencial global (campo inteiro)
         ally_candidates, enemy_candidates = self.DetectPlayerCandidates(
             img, imgHSV, timestamp, x_offset=0, y_offset=0, debug=debug
         )
 
-        # =========== PARTE 3: identificação + atualização do Kalman =======
         self.AssociatePlayerCandidates(ally_candidates, enemy_candidates, imgHSV, timestamp, debug=debug)
 
-        # ================== Finalização ================
         self._countProcess += 1
 
     # ==========================================================================================
     # PARTE 1/3 -- MOTOR DE DETECÇÃO DE CANDIDATOS (reutilizável em janelas de qualquer tamanho)
     # ==========================================================================================
     def DetectPlayerCandidates(self, img, imgHSV, timestamp, x_offset=0, y_offset=0,
-                                debug=False, max_players=6):
+                                    debug=False, max_players=6):
         """
         Gera a máscara genérica de objetos, extrai os contornos "crus" da
         janela recebida e, para cada um, classifica por tamanho: do tamanho
         de 1 robô -> candidato único (via _BuildPlayerCandidate); maior ->
         blob fundido (colisão), delegado para ResolveCollisionBlob (PARTE 2).
-
-        NÃO identifica a qual robô específico cada candidato pertence, nem
-        toca no filtro de Kalman -- isso é feito por AssociatePlayerCandidates
-        (PARTE 3). Isso é o que torna esta função segura de reaproveitar em
-        qualquer janela: ela só produz candidatos "crus" (time + posição +
-        janela de cor), sem efeitos colaterais sobre o estado dos robôs.
-
-        Parâmetros:
-            img, imgHSV: janela (BGR e HSV) onde procurar. Pode ser o campo
-                inteiro (self.fieldReduce, como usa DetectPlayers) ou um
-                recorte menor (ex.: uma ROI ao redor de uma colisão).
-            x_offset, y_offset: posição do canto superior esquerdo dessa
-                janela dentro do referencial GLOBAL usado por
-                self.TransformPoint / self.frameResult / self.binaryPlayers
-                (o mesmo referencial de `self.fieldReduce`). Use (0, 0)
-                quando `img` já É esse referencial inteiro (caso da chamada
-                em DetectPlayers). Os campos do candidato ("xi", "yi", "x_m",
-                "y_m" e a posição em cm) sempre saem em coordenadas GLOBAIS
-                (com o offset já somado); só "windowActual" (o recorte usado
-                para achar a cor aliada/inimiga) permanece local à janela.
-            max_players: teto de candidatos (aliados + inimigos) combinados.
-
-        Retorna (ally_candidates, enemy_candidates), cada um lista de dicts
-        no mesmo formato usado por AssociatePlayerCandidates.
         """
         ellipse5 = self.struct_ellipse5
         rect11 = self.struct_rect11
 
-        # =========== Máscara genérica ===========================
         obj_mask = cv2.inRange(imgHSV, self.objectsDarkColor, self.objectsLightColor)
         if self.ball.status:
-            # self.ball.xb/yb estão no referencial global; convertemos para
-            # local à janela recebida subtraindo o offset (com offset=0,
-            # zero diferença em relação ao comportamento original).
             xb, yb = int(self.ball.xb) - x_offset, int(self.ball.yb) - y_offset
             r = 5
             h, w = obj_mask.shape[:2]
@@ -2285,44 +1826,45 @@ class VisionSystem:
         closed_mask = cv2.erode(obj_mask, ellipse5, iterations=1)
         closed_mask = cv2.morphologyEx(closed_mask, cv2.MORPH_CLOSE, rect11)
 
-        # =========== Parâmetros ======================
         winSize = int(18 * self.prop_px_cm)
         half_win = winSize // 2
         playerRadius = (7.5 / 2) * np.sqrt(2) * self.prop_px_cm
         mainColorRadius = (7.5 / 4) * np.sqrt(5) * self.prop_px_cm
-        player_area_px = np.pi * playerRadius ** 2
-        NOISE_RADIUS_MIN = 0.2 * playerRadius     # abaixo disso, contorno é ruído da máscara, ignora
-        # Constantes acima são ponto de partida - calibrar com imagens reais de colisão.
+        single_area = np.pi * playerRadius ** 2   # área de UM robô
+        NOISE_RADIUS_MIN = 0.2 * playerRadius
 
         ally_candidates = []
         enemy_candidates = []
 
-        # ========= LOOP PRINCIPAL =======================
         raw_contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in raw_contours:
             if self.playersCount >= max_players:
                 break
             (cx, cy), r = cv2.minEnclosingCircle(cnt)
-
             if r < NOISE_RADIUS_MIN:
                 continue
 
-            # Desenhando os blobs (no referencial global -> soma o offset)
             if self.binaryPlayers is not None:
                 cv2.drawContours(self.binaryPlayers, [cnt], -1, 255, -1, offset=(x_offset, y_offset))
 
             area = cv2.contourArea(cnt)
-
             if area <= 0:
                 area = np.pi * r * r
-            n_est = max(1, round(area / player_area_px))
+
+            # ========== NOVA ESTIMATIVA DE n_est (considera sobreposição) ==========
+            if area > 2.2 * single_area:
+                n_est = 3
+            elif area > 1.2 * single_area:
+                n_est = 2
+            else:
+                n_est = 1
             n_est = min(n_est, max_players - self.playersCount)
+            # ======================================================================
 
             if debug and self.frameResult is not None:
                 color_circle = (0, 165, 255) if n_est > 1 else (0, 255, 0)
                 cv2.circle(self.frameResult, (int(cx) + x_offset, int(cy) + y_offset), int(r) + 5, color_circle, 2)
 
-            # Se for um candidato só ele faz o tratamento simples.
             if n_est <= 1:
                 result = self._BuildPlayerCandidate(
                     img, imgHSV, cx, cy, half_win, playerRadius, mainColorRadius,
@@ -2332,16 +1874,11 @@ class VisionSystem:
                     team_is_enemy, cand = result
                     (enemy_candidates if team_is_enemy else ally_candidates).append(cand)
                     self.playersCount += 1
-
-            ## Aqui ele trata do blob fundido, ou seja o
-            ## TRATAMENTO DE COLISÕES -- delegado para a PARTE 2.
             else:
                 centers = self.ResolveCollisionBlob(
                     img.shape, cnt, cx, cy, r, n_est, winSize, timestamp,
-                    x_offset=x_offset, y_offset=y_offset
+                    x_offset=x_offset, y_offset=y_offset, imgHSV=imgHSV
                 )
-
-                # Agora, para cada centro, constrói candidato
                 for (cx_i, cy_i) in centers[:n_est]:
                     result = self._BuildPlayerCandidate(
                         img, imgHSV, cx_i, cy_i, half_win, playerRadius, mainColorRadius,
@@ -2355,6 +1892,7 @@ class VisionSystem:
                             break
 
         return ally_candidates, enemy_candidates
+
 
     def _BuildPlayerCandidate(self, img, imgHSV, cx, cy, half_win, playerRadius, mainColorRadius,
                                x_offset=0, y_offset=0, cnt=None):
@@ -2432,67 +1970,207 @@ class VisionSystem:
     # PARTE 2/3 -- TRATAMENTO DE BLOBS GIGANTES (COLISÃO DE 2+ ROBÔS)
     # ==========================================================================================
     def ResolveCollisionBlob(self, img_shape, cnt, cx, cy, r, n_est, winSize, timestamp,
-                              x_offset=0, y_offset=0):
+                                x_offset=0, y_offset=0, imgHSV=None):
         """
-        Isolada de propósito: é o ÚNICO lugar que decide "quantos e onde"
-        estão os robôs escondidos dentro de um blob fundido (colisão de 2+
-        robôs, de qualquer time, ou até do mesmo time). Ajuste esta função
-        com cuidado -- ela é chamada tanto pela detecção no campo inteiro
-        quanto (se você optar por reaproveitar) por uma busca numa janela
-        menor -- sem precisar tocar em DetectPlayerCandidates (Parte 1) nem
-        em AssociatePlayerCandidates (Parte 3).
-
-        Estratégia atual (igual à original):
-          1) Erosão iterativa da máscara do próprio blob até separar em
-             `n_est` componentes conectados (_SplitBlobByErosion).
-          2) Se ainda faltar, completa com a posição PREVISTA (predict, sem
-             tocar no filtro) dos robôs que já tem Kalman inicializado
-             (_GetKalmanPredictedCenters), desde que a previsão caia dentro
-             do próprio blob.
-
-        Parâmetros:
-            img_shape: shape (H, W[, C]) da janela em que `cnt` foi
-                encontrado (mesmo referencial local de `cnt`, `cx`, `cy`).
-            cnt: contorno (cv2) do blob fundido, em coordenadas locais.
-            cx, cy: centro do blob (cv2.minEnclosingCircle), local.
-            r: raio do círculo envolvente do blob (usado para limitar a
-                distância aceita ao complementar com Kalman).
-            n_est: quantos robôs este blob deve conter (estimado por área).
-            winSize: tamanho de janela de um robô (mesma escala de
-                DetectPlayerCandidates), usado como margem no recorte da ROI
-                de erosão.
-            timestamp: tempo atual, repassado ao predict() do Kalman.
-            x_offset, y_offset: aceitos por consistência de assinatura com o
-                resto do pipeline (posição da janela no referencial global).
-                NÃO são aplicados ao complemento via Kalman abaixo -- ver nota
-                em _GetKalmanPredictedCenters sobre o referencial (imagem
-                virtual) em que aquela função já retornava os pontos na
-                versão original. Preservado assim de propósito para não
-                mudar o comportamento numérico atual; é o primeiro lugar a
-                revisar se for ajustar esta função.
-
-        Retorna até `n_est` centros (x, y) em coordenadas LOCAIS à janela
-        (mesmo referencial de `cnt`), prontos para alimentar
-        `_BuildPlayerCandidate`.
+        Separa um blob fundido (colisão) usando:
+        1. Busca geométrica dirigida (tags T1/T2)
+        2. Erosão sucessiva
+        3. Clustering por cor (K‑means) – NOVO FALLBACK
+        4. Predição do Kalman (último recurso)
         """
-        centers = self._SplitBlobByErosion(img_shape, cnt, cx, cy, n_est, winSize)
+        centers = []
 
+        # =========== PASSO 1: busca geométrica dirigida ==============
+        if imgHSV is not None:
+            geo_centers, _claimed_bots = self._GeometricCollisionSplit(
+                imgHSV, cnt, cx, cy, r, n_est, winSize, timestamp, x_offset, y_offset
+            )
+            centers.extend(geo_centers)
+
+        # =========== PASSO 2: erosão cega =============================
+        if len(centers) < n_est:
+            need = n_est - len(centers)
+            eroded = self._SplitBlobByErosion(img_shape, cnt, cx, cy, need, winSize)
+            for c in eroded:
+                if all(np.hypot(c[0] - ex, c[1] - ey) > 0.5 * r for (ex, ey) in centers):
+                    centers.append(c)
+                if len(centers) >= n_est:
+                    break
+
+        # =========== PASSO 2.5 (NOVO): clustering por cor ============
+        if len(centers) < n_est and imgHSV is not None:
+            # Cria máscara do blob
+            mask = np.zeros(img_shape[:2], dtype=np.uint8)
+            cv2.drawContours(mask, [cnt], -1, 255, -1)
+            # Recorta a região do blob para acelerar
+            x, y, w, h = cv2.boundingRect(cnt)
+            margin = int(0.3 * winSize)
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(img_shape[1], x + w + margin)
+            y2 = min(img_shape[0], y + h + margin)
+            roi_mask = mask[y1:y2, x1:x2]
+            roi_hsv = imgHSV[y1:y2, x1:x2]
+            pts = cv2.findNonZero(roi_mask)
+            if pts is not None and len(pts) > 10:
+                pts = pts.reshape(-1, 2)
+                colors = roi_hsv[pts[:,1], pts[:,0]].astype(np.float32)
+                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+                _, labels, _ = cv2.kmeans(colors, n_est, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+                for i in range(n_est):
+                    mask_i = (labels == i).flatten()
+                    pts_i = pts[mask_i]
+                    if len(pts_i) > 5:
+                        cx_cluster = np.mean(pts_i[:,0]) + x1
+                        cy_cluster = np.mean(pts_i[:,1]) + y1
+                        if all(np.hypot(cx_cluster - ex, cy_cluster - ey) > 0.4 * r for (ex, ey) in centers):
+                            centers.append((cx_cluster, cy_cluster))
+                            if len(centers) >= n_est:
+                                break
+
+        # =========== PASSO 3: Kalman puro (fallback final) ===========
         if len(centers) < n_est:
             need = n_est - len(centers)
             kalman_centers = (
                 self._GetKalmanPredictedCenters(ID_Team.TEAM_ALLY, need, timestamp) +
                 self._GetKalmanPredictedCenters(ID_Team.TEAM_ENEMY, need, timestamp)
             )
-            # Ordena pela distância ao centro do blob
             kalman_centers.sort(key=lambda p: np.hypot(p[0] - cx, p[1] - cy))
-            # Adiciona os primeiros `need` que não estejam muito longe
             for (px, py) in kalman_centers[:need]:
-                if np.hypot(px - cx, py - cy) < 2 * r:  # dentro do raio do blob
-                    centers.append((px, py))
+                if np.hypot(px - cx, py - cy) < 2 * r:
+                    if all(np.hypot(px - ex, py - ey) > 0.5 * r for (ex, ey) in centers):
+                        centers.append((px, py))
                     if len(centers) >= n_est:
                         break
 
         return centers[:n_est]
+
+
+    def _GeometricCollisionSplit(self, imgHSV, cnt, cx, cy, r, n_est, winSize, timestamp,
+                                  x_offset=0, y_offset=0):
+        """
+        Helper privado da PARTE 2 (v2). Implementa o passo 1 (busca
+        geométrica dirigida por robô conhecido) descrito no docstring de
+        ResolveCollisionBlob -- é a peça que substitui a erosão como método
+        PRIMÁRIO de separação do blob fundido.
+
+        Ideia central: em vez de perguntar "quantas manchas dá pra separar
+        aqui dentro" (erosão, cega quanto a identidade), pergunta "cada robô
+        que eu já conheço a cor está aqui dentro?" -- um teste de hipótese
+        por robô, igual ao já usado em DetectBotInRoi/SearchBot, só que
+        repetido para todos os candidatos plausíveis dentro da MESMA ROI do
+        blob fundido.
+
+        `imgHSV` precisa estar no MESMO referencial LOCAL de `cnt`/`cx`/`cy`
+        (o mesmo `imgHSV` recebido por DetectPlayerCandidates) -- ou seja,
+        NÃO é necessariamente self.imgHSV/self.hsv_fieldReduce inteiro, a
+        menos que a janela de detecção seja o campo inteiro com offset
+        (0, 0), como é o caso hoje em DetectPlayers.
+
+        Retorna (centers, claimed_bots):
+            centers: lista de até `n_est` centros (x, y) LOCAIS a `cnt`.
+            claimed_bots: set com os objetos Robot já resolvidos aqui (para
+                uso futuro por quem quiser evitar retrabalho na Parte 3;
+                não é consumido dentro desta função).
+        """
+        H, W = imgHSV.shape[:2]
+
+        # --- ROI de trabalho: bounding box do blob + margem de ~1 robô ---
+        x, y, w, h = cv2.boundingRect(cnt)
+        margin = int(0.6 * winSize)
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(W, x + w + margin)
+        y2 = min(H, y + h + margin)
+        if x2 <= x1 or y2 <= y1:
+            return [], set()
+        roi_hsv = imgHSV[y1:y2, x1:x2]
+
+        # --- Gate de sanidade em pixels (equivalente ao MAX_JUMP_CM usado
+        #     no resto do pipeline para gating de posição) ---
+        max_jump_px = max(self.MAX_JUMP_CM * self.prop_px_cm, float(winSize))
+
+        # --- Monta lista de robôs "elegíveis" (T1/T2 já conhecidos) -------
+        # Aliados: cor sempre conhecida (config fixa), então são elegíveis
+        # mesmo sem Kalman inicializado (robô que acabou de entrar em campo).
+        # Inimigos: só elegíveis depois de identificados ao menos uma vez
+        # (bot.colorCar1/colorCar2 cacheados por setColor em frames
+        # anteriores) -- antes disso, caem no fallback de erosão/Kalman.
+        candidates = []  # (priority, bot, team_hsv, primary_hsv, secondary_hsv, pred_local)
+        for team, team_list in ((ID_Team.TEAM_ALLY, self.allyTeam),
+                                 (ID_Team.TEAM_ENEMY, self.enemyTeam)):
+            team_hsv = self.allyColor if team == ID_Team.TEAM_ALLY else self.enemyColor
+            for bot in team_list:
+                primary = getattr(bot, "colorCar1", None)
+                secondary = getattr(bot, "colorCar2", None)
+                if primary is None or secondary is None:
+                    continue
+
+                pred_local = None
+                if getattr(bot, "kalman_initialized", False):
+                    try:
+                        x_pred, y_pred, _ = bot.predict(timestamp)
+                        xg, yg = self.GetImageRealIndice((x_pred, y_pred))
+                        pred_local = (float(xg) - x_offset, float(yg) - y_offset)
+                    except Exception:
+                        pred_local = None
+
+                if pred_local is not None:
+                    dist_to_blob = float(np.hypot(pred_local[0] - cx, pred_local[1] - cy))
+                    # Só entra como candidato "provável" se o Kalman prevê
+                    # esse robô dentro (ou bem perto) do próprio blob fundido.
+                    if dist_to_blob > 2.5 * r + winSize:
+                        continue
+                    priority = dist_to_blob
+                else:
+                    # Sem Kalman (robô novo/cold-start): ainda elegível --
+                    # testado depois dos que têm previsão, sem gate espacial
+                    # prévio (o gate de cor + jump ainda se aplica ao "hit").
+                    priority = 2.5 * r + winSize + 1.0
+
+                candidates.append((priority, bot, team_hsv, primary, secondary, pred_local))
+
+        if not candidates:
+            return [], set()
+
+        # Prioriza robôs cujo Kalman já aponta pra dentro do blob -- são os
+        # melhores palpites de "quem colidiu aqui", testados primeiro.
+        candidates.sort(key=lambda c: c[0])
+
+        centers = []
+        claimed_bots = set()
+        used_local_points = []
+
+        for priority, bot, team_hsv, primary, secondary, pred_local in candidates:
+            if len(centers) >= n_est:
+                break
+
+            hit = self.LocateBotGeometric(roi_hsv, team_hsv, primary, secondary)
+            if hit is None:
+                continue  # T1/T2 desse robô não apareceram nesta ROI
+
+            center_local = (float(hit['center'][0] + x1), float(hit['center'][1] + y1))
+
+            # --- Gate de sanidade (ataca o caso "troca de ID por simetria
+            # de cores"): um hit que bate na cor mas está longe demais de
+            # onde ESTE robô deveria estar é rejeitado -- ele provavelmente
+            # pertence a outro robô com cor parecida/trocada, que vai ser
+            # encontrado (corretamente) em sua própria iteração.
+            if pred_local is not None:
+                jump = np.hypot(center_local[0] - pred_local[0], center_local[1] - pred_local[1])
+                if jump > max_jump_px:
+                    continue
+
+            # --- Evita dois robôs "roubarem" quase o mesmo ponto físico ---
+            if any(np.hypot(center_local[0] - ux, center_local[1] - uy) < 0.4 * r
+                   for (ux, uy) in used_local_points):
+                continue
+
+            centers.append(center_local)
+            used_local_points.append(center_local)
+            claimed_bots.add(bot)
+
+        return centers, claimed_bots
 
     def _SplitBlobByErosion(self, img_shape, cnt, cx, cy, n_est, winSize):
         """
@@ -2592,42 +2270,16 @@ class VisionSystem:
     # ==========================================================================================
     def AssociatePlayerCandidates(self, ally_candidates, enemy_candidates, imgHSV, timestamp, debug=False):
         """
-        Decide a QUAL robô específico (ID) cada candidato "cru" (produzido
-        pela Parte 1/2) pertence, e alimenta o filtro de Kalman de cada um
-        (setPosition na primeira medição, updatePosition depois -- a MESMA
-        regra usada em todo o resto do módulo, preservada sem alterações).
-
-        - Inimigos: pareamento pela posição prevista/última conhecida por
-          slot (0, 1, 2), com gating de distância (self.MAX_JUMP_CM). A cada
-          acerto, ATUALIZA a árvore de cores (self.colorTree) com a cor
-          primária/secundária recém-observada daquele slot.
-        - Aliados: usa DetectAllyRobot(...) para checar as cores fixas
-          conhecidas de cada aliado (goleiro / atacante 1 / atacante 2), com
-          o mesmo gating de distância como checagem de sanidade.
-
-        `imgHSV` precisa ser a imagem HSV no MESMO referencial em que os
-        candidatos foram construídos (xi, yi, x_m, y_m) -- ou seja, a mesma
-        `imgHSV` passada para DetectPlayerCandidates.
-
-        PONTO DE EXTENSÃO (identificação por cor para os aliados):
-        a comparação por árvore de cores hoje só é CONSULTADA de fato via
-        self.colorTree.find_by_colors(...) / self.MatchesRobot(...); aqui
-        embaixo ela só é ALIMENTADA (add_robot) para os inimigos, a decisão
-        de qual slot inimigo é qual continua sendo por posição. Para usar a
-        mesma ideia nos aliados (útil justamente para desempatar candidatos
-        pós-colisão, quando a posição sozinha é ambígua), use o helper
-        IdentifyCandidateByColor(cand, imgHSV, self.allyColor) definido
-        abaixo: ele extrai a cor do candidato e consulta a árvore (que já
-        vem pré-populada com a cor de cada aliado via SetTreeColorDefault),
-        sem mexer no Kalman nem nos contadores -- dá pra usar o resultado
-        como um critério extra antes/depois do DetectAllyRobot(...) abaixo,
-        com segurança, sem tocar nas Partes 1 e 2.
+        Decide a QUAL robô específico (ID) cada candidato "cru" pertence.
+        - Aliados: identificação pela árvore de cores (já populada no início).
+        - Inimigos: pareamento por posição na primeira detecção; depois usa a árvore
+        de cores como critério adicional para evitar troca de IDs em colisões.
         """
         MAX_JUMP_CM = self.MAX_JUMP_CM
-        AgoalFlag = Aatk1Flag = Aatk2Flag = False
 
-        # ================= Associação de inimigos =============
+        # ================= Associação de inimigos =====================
         if enemy_candidates:
+            # --- Fase 1: pareamento por posição (cold start e fallback) ---
             pairs = []
             n_slots = min(3, len(self.enemyTeam))
             for ci, cand in enumerate(enemy_candidates):
@@ -2638,22 +2290,46 @@ class VisionSystem:
             pairs.sort(key=lambda p: p[0])
             used_candidates, used_slots = set(), set()
             assignment = {}  # slot -> índice do candidato
+
+            # --- Fase 2: para cada par, tenta associar, usando cor como confirmação, não como barreira ---
             for dist, ci, slot in pairs:
                 if ci in used_candidates or slot in used_slots:
                     continue
                 last = self._enemy_last_pos.get(slot)
                 if last is not None and dist > MAX_JUMP_CM:
                     continue
-                assignment[slot] = ci
-                used_candidates.add(ci)
-                used_slots.add(slot)
-            for slot, ci in assignment.items():
+
                 cand = enemy_candidates[ci]
-                bot = self.enemyTeam[slot]
+                # Obtém as cores do candidato
                 Color_p_pt, Color_s_pt, _ = self.GetCentersColors(cand["xi"], cand["yi"], cand["x_m"], cand["y_m"])
                 Color_p = self.GetHsvMean(imgHSV, Color_p_pt[0], Color_p_pt[1])
                 Color_s = self.GetHsvMean(imgHSV, Color_s_pt[0], Color_s_pt[1])
+
+                # Verifica se existe algum match na árvore para essas cores
+                existing = self.colorTree.find_by_colors(self.enemyColor, Color_p, Color_s)
+                
+                # Decisão:
+                # - Se há match e o robot_id é diferente do slot, rejeitamos (evita troca de IDs).
+                # - Caso contrário (sem match ou match com o próprio slot), permitimos a associação.
+                if existing is not None and existing['robot_id'] != slot:
+                    continue
+
+                # Se chegou aqui, a associação é permitida (por posição ou por cor confirmada)
+                assignment[slot] = ci
+                used_candidates.add(ci)
+                used_slots.add(slot)
+
+            # --- Fase 3: aplica as associações e atualiza o Kalman ---
+            for slot, ci in assignment.items():
+                cand = enemy_candidates[ci]
+                bot = self.enemyTeam[slot]
+                # Recalcula as cores (já temos, mas garantimos)
+                Color_p_pt, Color_s_pt, _ = self.GetCentersColors(cand["xi"], cand["yi"], cand["x_m"], cand["y_m"])
+                Color_p = self.GetHsvMean(imgHSV, Color_p_pt[0], Color_p_pt[1])
+                Color_s = self.GetHsvMean(imgHSV, Color_s_pt[0], Color_s_pt[1])
+                # Atualiza a árvore (se já existir, atualiza a média; se não, insere)
                 self.colorTree.add_robot(ID_Team.TEAM_ENEMY, slot, self.enemyColor, Color_p, Color_s)
+
                 if not bot.kalman_initialized:
                     bot.setPosition(cand["xcm"], cand["ycm"], cand["direction"], cand["windowActual"], time=timestamp)
                 else:
@@ -2662,14 +2338,12 @@ class VisionSystem:
                 bot.setStatus(True)
                 bot.setRadius(cand["rcm"])
                 bot.setColor(colorT=self.enemyColor, colorP=Color_p, colorS=Color_s)
+
                 self.DrawPlayerVirtual(bot)
                 self._enemy_last_pos[slot] = (cand["xcm"], cand["ycm"])
                 self.enemiesCount += 1
 
-                # ----- DESENHO BÁSICO (sempre) -----
                 self.DrawPlayerCircle(self.frameResult, bot)
-
-                # ----- DESENHOS EXTRAS (apenas com debug) -----
                 if debug:
                     if bot.kalman_initialized:
                         self.DrawFilteredPosition(bot)
@@ -2682,64 +2356,50 @@ class VisionSystem:
                     cv2.circle(self.frameResult, (cx3, cy3), 4, (0, 0, 0), -1)
                     cv2.circle(self.frameResult, (cx3, cy3), 3, bgr_s, -1)
 
-        #================== Associação de aliados ==============
+        # ================= Associação de aliados ======================
+        # Para aliados, a árvore já está populada desde o início (SetTreeColorDefault),
+        # então usamos a identificação por cor sem necessidade de fallback.
         for cand in ally_candidates:
             if self.alliesCount >= 3:
                 break
-            ally_checks = [
-                (not AgoalFlag, self.goalAllyColor1, self.goalAllyColor2, ID_Robots.ROBOT_ALLY_GOAL, "Goleiro"),
-                (not Aatk1Flag, self.atk1AllyColor1, self.atk1AllyColor2, ID_Robots.ROBOT_ALLY_1, "Atacante 1"),
-                (not Aatk2Flag, self.atk2AllyColor1, self.atk2AllyColor2, ID_Robots.ROBOT_ALLY_2, "Atacante 2"),
-            ]
-            assigned = False
-            for flag, c1, c2, bot_id, name in ally_checks:
-                if not (flag and self.DetectAllyRobot(cand["windowActual"], c1, c2)):
-                    continue
-                last = self._ally_last_pos.get(bot_id)
-                if last is not None:
-                    dist = float(np.hypot(cand["xcm"] - last[0], cand["ycm"] - last[1]))
-                    if dist > MAX_JUMP_CM:
-                        continue  # provável contaminação de cor por um robô vizinho
-                bot = self.allyTeam[bot_id]
-                if not bot.kalman_initialized:
-                    bot.setPosition(cand["xcm"], cand["ycm"], cand["direction"], cand["windowActual"], time=timestamp)
-                else:
-                    bot.updatePosition(cand["xcm"], cand["ycm"], cand["direction"], cand["windowActual"], time=timestamp)
-                bot.updtPositionImg(cand["xi"], cand["yi"], cand["ri"])
-                bot.setStatus(True)
-                bot.setRadius(cand["rcm"])
-                bot.setColor(colorT=self.allyColor, colorP=c1, colorS=c2)
 
-                if cand["contour"] is not None:
-                    cv2.drawContours(self.binaryAllies, [cand["contour"]], -1, 255, -1)
-                else:
-                    cv2.circle(self.binaryAllies, (int(cand["xi"]), int(cand["yi"])), int(cand["ri"]), 255, -1)
-
-                # ----- DESENHO BÁSICO (sempre) -----
-                self.DrawPlayerCircle(self.frameResult, bot)
-
-                # ----- DESENHOS EXTRAS (apenas com debug) -----
-                if debug:
-                    if bot.kalman_initialized:
-                        self.DrawFilteredPosition(bot)
-                    cv2.circle(self.frameResult, (int(cand["x_m"]), int(cand["y_m"])), 4, (255, 128, 255), -1)
-
-                self.DrawPlayerVirtual(bot)
-                self._ally_last_pos[bot_id] = (cand["xcm"], cand["ycm"])
-
-                if bot_id == ID_Robots.ROBOT_ALLY_GOAL:
-                    AgoalFlag = True
-                elif bot_id == ID_Robots.ROBOT_ALLY_1:
-                    Aatk1Flag = True
-                else:
-                    Aatk2Flag = True
-                assigned = True
-                break
-
-            if not assigned:
+            match, Color_p, Color_s = self.IdentifyCandidateByColor(cand, imgHSV, self.allyColor)
+            if match is None:
                 continue
+            bot_id = match['robot_id']
+            bot = self.allyTeam[bot_id]
 
-            self.alliesCount = min(self.alliesCount + 1, 3)
+            # Gating de distância (segurança)
+            last = self._ally_last_pos.get(bot_id)
+            if last is not None:
+                dist = float(np.hypot(cand["xcm"] - last[0], cand["ycm"] - last[1]))
+                if dist > MAX_JUMP_CM:
+                    continue
+
+            if not bot.kalman_initialized:
+                bot.setPosition(cand["xcm"], cand["ycm"], cand["direction"], cand["windowActual"], time=timestamp)
+            else:
+                bot.updatePosition(cand["xcm"], cand["ycm"], cand["direction"], cand["windowActual"], time=timestamp)
+            bot.updtPositionImg(cand["xi"], cand["yi"], cand["ri"])
+            bot.setStatus(True)
+            bot.setRadius(cand["rcm"])
+            bot.setColor(colorT=self.allyColor, colorP=Color_p, colorS=Color_s)
+
+            if cand["contour"] is not None:
+                cv2.drawContours(self.binaryAllies, [cand["contour"]], -1, 255, -1)
+            else:
+                cv2.circle(self.binaryAllies, (int(cand["xi"]), int(cand["yi"])), int(cand["ri"]), 255, -1)
+
+            self.DrawPlayerCircle(self.frameResult, bot)
+            if debug:
+                if bot.kalman_initialized:
+                    self.DrawFilteredPosition(bot)
+                cv2.circle(self.frameResult, (int(cand["x_m"]), int(cand["y_m"])), 4, (255, 128, 255), -1)
+
+            self.DrawPlayerVirtual(bot)
+            self._ally_last_pos[bot_id] = (cand["xcm"], cand["ycm"])
+            self.alliesCount += 1
+
 
     def IdentifyCandidateByColor(self, cand, imgHSV, main_color):
         """
@@ -3367,7 +3027,6 @@ class VisionSystem:
     # ==========================================================================================
     # BLOCO 9: PIPELINE PRINCIPAL (PROC, PROCESSIMG E FILTEREDDETECTION)
     # ==========================================================================================
-    
     def Proc(self, img, currentTime, debug: bool, isT: bool = False, force_field_detect: bool = True):
         """
         Executa a detecção do campo (sob demanda) e robôs.
@@ -3486,7 +3145,6 @@ class VisionSystem:
                 self.frameResult = None
 
         return self.frameResult
-
 
     def ProcessImg(self, img, debug: bool):
         """
