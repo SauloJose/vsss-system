@@ -4,6 +4,7 @@
 import cv2
 import numpy as np
 from timer import *
+import os
 
 from modules.VisionSys.components.objects import *
 from modules.VisionSys.components.viewcapture import *
@@ -39,6 +40,10 @@ class VisionSystem:
         self.ball_kalman_reset_flag = False
         self.missed_frames_robots = {}
         self.robot_kalman_reset_flags = {}
+
+
+        ## Variável de debug temporária
+        self.var_d = True 
 
         # Gating de distância – rejeita saltos implausíveis
         self.MAX_JUMP_CM = 60.0
@@ -231,15 +236,18 @@ class VisionSystem:
         ], dtype=np.float32)
 
         # Kernels morfológicos padrão (reutilizados em todo o código)
+        self.struct_ellipse3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.struct_ellipse5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        self.struct_rect11 = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-
-        # Kernels adicionais para operações mais finas / robustas
-        self.kernel_ellipse3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.struct_ellipse7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        self.struct_rect7 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        self.struct_rect13 = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
+        self.struct_ellipse11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        self.struct_ellipse13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
 
+        self.struct_rect3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        self.struct_rect5 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        self.struct_rect7 = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        self.struct_rect11 = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+        self.struct_rect13 = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
+        
         # ==============================================================
         # 9. CONSTRUÇÃO DO CAMPO (após todos os parâmetros)
         # ==============================================================
@@ -1581,15 +1589,20 @@ class VisionSystem:
         imgHSV = hsv_img if hsv_img is not None else cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         debug = dbg
 
+        # caches das ultimas posições, para garantir que possa verificar continuidade.
+        # Obs: Salvo engano, as classes dos robôs já tem essa informação, talvez seja desnecessário.
         if not hasattr(self, "_enemy_last_pos"):
             self._enemy_last_pos = {}   # {slot: (xcm, ycm)}
         if not hasattr(self, "_ally_last_pos"):
             self._ally_last_pos = {}    # {bot_id: (xcm, ycm)}
 
+        # Inicializo contabilização
         self.playersCount = self.enemiesCount = self.alliesCount = 0
         for bot in (*self.enemyTeam, *self.allyTeam):
             bot.setStatus(False)
 
+        ## Instancio as máscaras binárias como nulas para reiniciar o código.
+        # Talvez possa otimizar passando para ele copiar?
         self.binaryPlayers = np.zeros(img.shape[:2], dtype=np.uint8)
         self.binaryAllies = np.zeros(img.shape[:2], dtype=np.uint8)
 
@@ -1606,18 +1619,22 @@ class VisionSystem:
     # PARTE 1/3 -- MOTOR DE DETECÇÃO DE CANDIDATOS (reutilizável em janelas de qualquer tamanho)
     # ==========================================================================================
     def DetectPlayerCandidates(self, img, imgHSV, timestamp, x_offset=0, y_offset=0,
-                                    debug=False, max_players=6):
+                                        debug=False, max_players=6):
         """
         Gera a máscara genérica de objetos, extrai os contornos "crus" da
         janela recebida e, para cada um, classifica por tamanho: do tamanho
         de 1 robô -> candidato único (via _BuildPlayerCandidate); maior ->
         blob fundido (colisão), delegado para ResolveCollisionBlob (PARTE 2).
         """
-        ellipse5 = self.struct_ellipse5
-        rect11 = self.struct_rect11
 
+        if self.var_d: print("[VS][DEBUG][DETECPLAYER]:  Iniciando fichario da análise.")
+
+        #Etapa 1 - Gero uma máscara para puxar os objetos
         obj_mask = cv2.inRange(imgHSV, self.objectsDarkColor, self.objectsLightColor)
+
+        # Etapa 2 - Exclusão da máscara da bola
         if self.ball.status:
+            if self.var_d: print("[VS][DEBUG][DETECPLAYER]:  Bola já foi detectada.")
             xb, yb = int(self.ball.xb) - x_offset, int(self.ball.yb) - y_offset
             r = 5
             h, w = obj_mask.shape[:2]
@@ -1625,23 +1642,71 @@ class VisionSystem:
             x1b, x2b = max(0, xb - r), min(w, xb + r)
             obj_mask[y1b:y2b, x1b:x2b] = 0
 
-        closed_mask = cv2.erode(obj_mask, ellipse5, iterations=1)
-        closed_mask = cv2.morphologyEx(closed_mask, cv2.MORPH_CLOSE, rect11)
+        # =====> Etapa 3 - Morfologia adaptativa por faixas de resolução =====
+        px_cm = self.prop_px_cm
 
+        # Seleção dos kernels conforme a resolução
+        if px_cm <= 3.0:
+            kernel_erode = self.struct_ellipse3
+            kernel_close = self.struct_rect5
+            it_erode = 2
+            faixa = "1/3 (px/cm <= 3.0)"
+        elif px_cm <= 4.0:
+            kernel_erode = self.struct_ellipse5
+            kernel_close = self.struct_rect5
+            it_erode = 1
+            faixa = "2/3 (3.0 < px/cm <= 4.0)"
+        else:
+            kernel_erode = self.struct_ellipse5
+            kernel_close = self.struct_rect11
+            it_erode = 2
+            faixa = "3/3 (px/cm > 4.0)"
+
+        # Aplica a morfologia (uma única vez)
+        closed_mask = cv2.erode(obj_mask, kernel_erode, iterations=it_erode)
+        closed_mask = cv2.morphologyEx(closed_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+        if self.var_d:
+            print(f"[VS][DEBUG][DETECPLAYER]: Faixa {faixa} - px/cm atual: {px_cm:.2f} - Erosão: {kernel_erode.shape[0]}x{kernel_erode.shape[1]}, Fechamento: {kernel_close.shape[0]}x{kernel_close.shape[1]}")
+            
+            cv2.imshow("Mascara dos objetos", obj_mask)
+            cv2.imshow("Mascara dos objetos fechados", closed_mask)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        # ===================================================================
+
+        # HELPERS em pixels
         winSize = int(18 * self.prop_px_cm)
         half_win = winSize // 2
-        playerRadius = (7.5 / 2) * np.sqrt(2) * self.prop_px_cm
-        mainColorRadius = (7.5 / 4) * np.sqrt(5) * self.prop_px_cm
-        single_area = np.pi * playerRadius ** 2   # área de UM robô
+        playerRadius = 5.3033 * self.prop_px_cm
+        mainColorRadius = 4.1926 * self.prop_px_cm
+        single_area = 56.25 * (self.prop_px_cm ** 2)
         NOISE_RADIUS_MIN = 0.2 * playerRadius
+
+        if self.var_d:
+            txt = f"[VS][DEBUG][DETECPLAYER]: \n - px/cm= {self.prop_px_cm:.2f} \n - Largura da Janela (18cm) = {winSize:.2f} px \n - Raio do Player Previsto = {playerRadius:.2f} px \n - Raio da cor Principal = {mainColorRadius} px \n - Area unitaria de um player = {single_area:.2f} px²"
+            print(txt)
 
         ally_candidates = []
         enemy_candidates = []
 
+        # Etapa 4 - Busca os contornos
         raw_contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in raw_contours:
+
+        # Filtra por área mínima (20% da área de um robô)
+        min_area_threshold = 0.2 * single_area
+        filtered_contours = [cnt for cnt in raw_contours if cv2.contourArea(cnt) >= min_area_threshold]
+
+        if self.var_d:
+            print(f"[VS][DEBUG][DETECPLAYER]:  Contornos brutos: {len(raw_contours)}, filtrados: {len(filtered_contours)}")
+
+        i = 1
+        for cnt in filtered_contours:
+            if self.var_d: print(f"[VS][DEBUG][DETECPLAYER]: ============> Avaliando contorno {i} <=========")
             if self.playersCount >= max_players:
+                if self.var_d: print("[VS][DEBUG][DETECPLAYER]: Avaliou todos os players. Saindo do for.")
                 break
+
             (cx, cy), r = cv2.minEnclosingCircle(cnt)
             if r < NOISE_RADIUS_MIN:
                 continue
@@ -1653,38 +1718,47 @@ class VisionSystem:
             if area <= 0:
                 area = np.pi * r * r
 
-            # ========== NOVA ESTIMATIVA DE n_est (considera sobreposição) ==========
-            if area > 2.2 * single_area:
-                n_est = 3
-            elif area > 1.2 * single_area:
-                n_est = 2
-            else:
+            ratio = area / single_area
+            if self.var_d: print(f"[VS][DEBUG][DETECPLAYER]: Avaliando área do contorno {area:.2f}")
+            if ratio < 1.2:
                 n_est = 1
-            n_est = min(n_est, max_players - self.playersCount)
-            # ======================================================================
+            else:
+                CORRECTION_FACTOR = 1.2
+                n_est = int(np.ceil(ratio * CORRECTION_FACTOR))
+                n_est = min(n_est, max_players - self.playersCount)
+
+            if self.var_d: print(f"[VS][DEBUG][DETECPLAYER]: Razão = {ratio:.2f} estima ter {n_est:.2f} players nesse grande BLOB")
 
             if debug and self.frameResult is not None:
                 color_circle = (0, 165, 255) if n_est > 1 else (0, 255, 0)
                 cv2.circle(self.frameResult, (int(cx) + x_offset, int(cy) + y_offset), int(r) + 5, color_circle, 2)
 
             if n_est <= 1:
+                if self.var_d: print(f"[VS][DEBUG][DETECPLAYER]: Blob de um único indivíduo")
                 result = self._BuildPlayerCandidate(
                     img, imgHSV, cx, cy, half_win, playerRadius, mainColorRadius,
                     x_offset, y_offset, cnt=cnt
                 )
                 if result is not None:
+                    if self.var_d: print("[VS][DEBUG][DETECPLAYER]:  Etapa do processamento da colisão realizada.")
                     team_is_enemy, cand = result
                     (enemy_candidates if team_is_enemy else ally_candidates).append(cand)
                     self.playersCount += 1
             else:
-                centers = self.ResolveCollisionBlob(
-                    img.shape, cnt, cx, cy, r, n_est, winSize, timestamp,
-                    x_offset=x_offset, y_offset=y_offset, imgHSV=imgHSV
+                if self.var_d: print(f"[VS][DEBUG][DETECPLAYER]: Blob contém mais de um player.")
+                winSizeBlob = 2 * r
+                centers, individual_masks = self.ResolveCollisionBlob(
+                    img.shape, cnt, cx, cy, r, n_est, winSizeBlob, timestamp,
+                    x_offset=x_offset, y_offset=y_offset, imgHSV=imgHSV,
+                    img=img
                 )
-                for (cx_i, cy_i) in centers[:n_est]:
+                for idx, (cx_i, cy_i) in enumerate(centers[:n_est]):
+                    mask_i = individual_masks[idx] if idx < len(individual_masks) else None
                     result = self._BuildPlayerCandidate(
                         img, imgHSV, cx_i, cy_i, half_win, playerRadius, mainColorRadius,
-                        x_offset, y_offset, cnt=None
+                        x_offset, y_offset, cnt=None,
+                        isBlob=True,
+                        individual_mask=mask_i
                     )
                     if result is not None:
                         team_is_enemy, cand = result
@@ -1692,12 +1766,11 @@ class VisionSystem:
                         self.playersCount += 1
                         if self.playersCount >= max_players:
                             break
+            i += 1
 
         return ally_candidates, enemy_candidates
 
-
-    def _BuildPlayerCandidate(self, img, imgHSV, cx, cy, half_win, playerRadius, mainColorRadius,
-                               x_offset=0, y_offset=0, cnt=None):
+    def _BuildPlayerCandidate(self, img, imgHSV, cx, cy, half_win, playerRadius, mainColorRadius, x_offset=0, y_offset=0, cnt=None, isBlob=False, individual_mask=None):
         """
         Helper privado da PARTE 1. Constrói um candidato a robô a partir de um
         centro estimado (cx, cy) em coordenadas LOCAIS a `img`/`imgHSV`.
@@ -1707,23 +1780,55 @@ class VisionSystem:
         x_m, y_m e a conversão px->cm via TransformPoint) -- o recorte
         "windowActual" continua local, pois só é usado para achar a cor
         dentro da própria janela.
+
+        Se `isBlob=True` e `individual_mask` for fornecido (full-frame), a máscara
+        é aplicada sobre a janela HSV para isolar o robô atual (evitando interferência
+        do robô vizinho em colisões).
         """
+        # Etapa 1 - Define os cantos da janela com base no centro e no raio da janela (half_win)
+        # Garante que a janela não ultrapasse as bordas da imagem original.
         x1 = max(0, int(cx - half_win))
         y1 = max(0, int(cy - half_win))
         x2 = min(img.shape[1], int(cx + half_win))
         y2 = min(img.shape[0], int(cy + half_win))
+
+        # Etapa 2 - Recorta a região da imagem RGB correspondente à janela definida.
+        # Esta janela será usada posteriormente para exibição e debug.
         windowActual = img[y1:y2, x1:x2]
         if windowActual.size == 0:
             return None
-        hsv = imgHSV[y1:y2, x1:x2]
+
+        if self.var_d: 
+            print("[VS][DEBUG][DETECPLAYER][BuildPlayersCandidate]:  Janela de tratamento da colisão")
+
+        # Etapa 3 - Recorta a imagem HSV na mesma região.
+        # Se for um blob de colisão e tivermos uma máscara individual, aplicamos ela AGORA.
+        if self.var_d: 
+            print("[VS][DEBUG][DETECPLAYER][BuildPlayersCandidate]:  Etapa de identificação dos players na janela do Blob")
+        
+        hsv = imgHSV[y1:y2, x1:x2]  # Recorte local da janela
+
+        # Etapa 3.1 - (NOVO) Aplica a máscara individual (se fornecida) para isolar APENAS o robô atual
+        if isBlob and individual_mask is not None:
+            # A máscara individual está em coordenadas full-frame; recortamos a parte da janela
+            mask_local = individual_mask[y1:y2, x1:x2]
+            # Aplica a máscara sobre a imagem HSV (zera os pixels fora do robô atual)
+            hsv = cv2.bitwise_and(hsv, hsv, mask=mask_local)
+            if self.var_d:
+                print("[VS][DEBUG][DETECPLAYER][BuildPlayersCandidate]:  Máscara individual aplicada na janela HSV (isolando o robô).")
+
+        # Etapa 4 - Gera máscaras binárias para aliados e inimigos (agora filtradas pela máscara individual, se houver)
         mask_ally = self.MaskInRange(hsv, self.ally_lower_bound, self.ally_upper_bound)
         mask_enemy = self.MaskInRange(hsv, self.enemy_lower_bound, self.enemy_upper_bound)
+
+        # Etapa 5 - Calcula a área (número de pixels) de cada máscara e decide o time
+        # com base na proporção. Se nenhuma cor for predominante (>40%), descarta o candidato.
         ally_area = cv2.countNonZero(mask_ally)
         enemy_area = cv2.countNonZero(mask_enemy)
         total_area = max(ally_area + enemy_area, 1)
         ally_ratio = ally_area / total_area
         enemy_ratio = enemy_area / total_area
-
+        
         if ally_ratio > 0.4:
             team_is_enemy = False
         elif enemy_ratio > 0.4:
@@ -1731,34 +1836,46 @@ class VisionSystem:
         else:
             return None
 
+        # Etapa 6 - Seleciona a máscara correspondente ao time definido e encontra
+        # o maior contorno externo. Em seguida, calcula o círculo mínimo envolvente
+        # para obter o centro (x_m, y_m) e o raio rc da mancha de cor.
         curr_mask = mask_enemy if team_is_enemy else mask_ally
         contour = max(cv2.findContours(curr_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0],
                     key=cv2.contourArea, default=None)
         if contour is None:
             return None
         (x_m, y_m), rc = cv2.minEnclosingCircle(contour)
+
+        # Etapa 7 - Converte as coordenadas do centro da mancha para o sistema
+        # da imagem inteira (somando x1, y1) e verifica se o raio da mancha é
+        # grande o suficiente para ser considerado um robô (limiar diferente para
+        # inimigos e aliados).
         x_m += x1
         y_m += y1
         min_rc = (0.75 if team_is_enemy else 0.5) * mainColorRadius
         if rc < min_rc:
             return None
 
-        # Direção: diferença de vetores é invariante a translação, então
-        # tanto faz usar coordenadas locais ou globais aqui -- mantido local
-        # (idêntico ao cálculo original).
+        # Etapa 8 - Calcula a direção (vetor unitário) que aponta do centro da
+        # mancha de cor (x_m, y_m) para o centro estimado (cx, cy). A inversão
+        # do eixo y (uso de -cy e -y_m) é para adequar ao sistema de coordenadas
+        # da imagem (origem no canto superior esquerdo).
         direction = np.array([cx, -cy]) - np.array([x_m, -y_m])
         modDir = np.linalg.norm(direction)
         if modDir > 1e-6:
             direction = direction / modDir
 
-        # Coordenadas GLOBAIS (somando o offset da janela): usadas na
-        # conversão px->cm e em todo campo que é consumido fora desta janela
-        # (desenho em self.frameResult, identificação na Parte 3, etc.).
+        # Etapa 9 - Soma o offset da janela (x_offset, y_offset) para obter
+        # coordenadas globais (no sistema do campo inteiro). Essas coordenadas
+        # serão usadas para desenho, identificação na Parte 3 e conversão para cm.
         cx_g, cy_g = cx + x_offset, cy + y_offset
         x_m_g, y_m_g = x_m + x_offset, y_m + y_offset
 
         xcm, ycm = self.GetPointVirtual(self.TransformPoint(np.array([cx_g, cy_g])))
 
+        # Etapa 10 - Retorna uma tupla (team_is_enemy, dicionário com todas as
+        # informações do candidato: centro estimado, centro da mancha, posição em cm,
+        # direção, janela recortada e o contorno original (se fornecido)).
         return team_is_enemy, {
             "xi": cx_g, "yi": cy_g, "ri": playerRadius,
             "x_m": x_m_g, "y_m": y_m_g,
@@ -1771,81 +1888,102 @@ class VisionSystem:
     # ==========================================================================================
     # PARTE 2/3 -- TRATAMENTO DE BLOBS GIGANTES (COLISÃO DE 2+ ROBÔS)
     # ==========================================================================================
-    def ResolveCollisionBlob(self, img_shape, cnt, cx, cy, r, n_est, winSize, timestamp,
-                                x_offset=0, y_offset=0, imgHSV=None):
+    def ResolveCollisionBlob(self, img_shape, cnt, cx, cy, r, n_est, winSizeBlob, timestamp,
+                            x_offset=0, y_offset=0, imgHSV=None, img=None,
+                            save_path="src/data/study/"):
         """
-        Separa um blob fundido (colisão) usando:
-        1. Busca geométrica dirigida (tags T1/T2)
-        2. Erosão sucessiva
-        3. Clustering por cor (K‑means) – NOVO FALLBACK
-        4. Predição do Kalman (último recurso)
-        """
-        centers = []
+        (VERSÃO DE ESTUDO - SEM ALGORITMO DE SEPARAÇÃO AINDA)
+        Recebe um blob fundido (contorno) e estima quantos robôs estão ali.
+        Retorna centros (estimados) e uma máscara full-frame para cada robô.
 
-        # =========== PASSO 1: busca geométrica dirigida ==============
+        Agora as imagens de debug são salvas em disco (em save_path) em vez de exibidas com cv2.imshow.
+        """
+        # ========== INÍCIO DO DEBUG ==========
+        if self.var_d:
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Iniciando tratamento da colisão para encontrar centros.")
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Estimativa de {} robôs neste blob.".format(n_est))
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centro aproximado ({:.1f}, {:.1f}) e Raio {:.1f} px".format(cx, cy, r))
+
+        # Cria o diretório de saída se não existir
+        full_save_path = os.path.join(os.getcwd(), save_path)
+        os.makedirs(full_save_path, exist_ok=True)
+
+        # Gera um identificador único para este blob (baseado no timestamp e nas coordenadas)
+        # timestamp pode ser float; usamos uma string com 6 casas decimais para evitar conflitos
+        ts_str = f"{timestamp:.6f}".replace('.', '_')
+        blob_id = f"blob_{ts_str}_cx{int(cx)}_cy{int(cy)}"
+
+        # Etapa 1 - Obtém a bounding box do contorno para recortar a região de interesse (ROI)
+        x, y, w, h = cv2.boundingRect(cnt)
+        margin = 5
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(img_shape[1], x + w + margin)
+        y2 = min(img_shape[0], y + h + margin)
+
+        if self.var_d:
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Bounding Box do Blob: ({}, {}) -> ({}, {})".format(x1, y1, x2, y2))
+
+        # Etapa 2 - Cria uma máscara full-frame do blob
+        mask_full = np.zeros(img_shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask_full, [cnt], -1, 255, -1)
+
+        # Etapa 3 - Recorta as ROIs
+        mask_roi = mask_full[y1:y2, x1:x2]
+        hsv_roi = None
+        img_roi = None
+
+        if img is not None:
+            img_roi = img[y1:y2, x1:x2]
         if imgHSV is not None:
-            geo_centers, _claimed_bots = self._GeometricCollisionSplit(
-                imgHSV, cnt, cx, cy, r, n_est, winSize, timestamp, x_offset, y_offset
-            )
-            centers.extend(geo_centers)
+            hsv_roi = imgHSV[y1:y2, x1:x2]
 
-        # =========== PASSO 2: erosão cega =============================
-        if len(centers) < n_est:
-            need = n_est - len(centers)
-            eroded = self._SplitBlobByErosion(img_shape, cnt, cx, cy, need, winSize)
-            for c in eroded:
-                if all(np.hypot(c[0] - ex, c[1] - ey) > 0.5 * r for (ex, ey) in centers):
-                    centers.append(c)
-                if len(centers) >= n_est:
-                    break
+        # ========== SALVA AS IMAGENS DA ROI ==========
+        # Salva a imagem RGB (se disponível)
+        if img_roi is not None:
+            rgb_filename = os.path.join(full_save_path, f"{blob_id}_rgb.png")
+            cv2.imwrite(rgb_filename, img_roi)
+            if self.var_d:
+                print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Imagem RGB salva em {rgb_filename}")
 
-        # =========== PASSO 2.5 (NOVO): clustering por cor ============
-        if len(centers) < n_est and imgHSV is not None:
-            # Cria máscara do blob
-            mask = np.zeros(img_shape[:2], dtype=np.uint8)
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
-            # Recorta a região do blob para acelerar
-            x, y, w, h = cv2.boundingRect(cnt)
-            margin = int(0.3 * winSize)
-            x1 = max(0, x - margin)
-            y1 = max(0, y - margin)
-            x2 = min(img_shape[1], x + w + margin)
-            y2 = min(img_shape[0], y + h + margin)
-            roi_mask = mask[y1:y2, x1:x2]
-            roi_hsv = imgHSV[y1:y2, x1:x2]
-            pts = cv2.findNonZero(roi_mask)
-            if pts is not None and len(pts) > 10:
-                pts = pts.reshape(-1, 2)
-                colors = roi_hsv[pts[:,1], pts[:,0]].astype(np.float32)
-                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-                _, labels, _ = cv2.kmeans(colors, n_est, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-                for i in range(n_est):
-                    mask_i = (labels == i).flatten()
-                    pts_i = pts[mask_i]
-                    if len(pts_i) > 5:
-                        cx_cluster = np.mean(pts_i[:,0]) + x1
-                        cy_cluster = np.mean(pts_i[:,1]) + y1
-                        if all(np.hypot(cx_cluster - ex, cy_cluster - ey) > 0.4 * r for (ex, ey) in centers):
-                            centers.append((cx_cluster, cy_cluster))
-                            if len(centers) >= n_est:
-                                break
+        # Salva a máscara do blob (objeto escuro)
+        mask_filename = os.path.join(full_save_path, f"{blob_id}_mask_blob.png")
+        cv2.imwrite(mask_filename, mask_roi)
+        if self.var_d:
+            print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara do Blob salva em {mask_filename}")
 
-        # =========== PASSO 3: Kalman puro (fallback final) ===========
-        if len(centers) < n_est:
-            need = n_est - len(centers)
-            kalman_centers = (
-                self._GetKalmanPredictedCenters(ID_Team.TEAM_ALLY, need, timestamp) +
-                self._GetKalmanPredictedCenters(ID_Team.TEAM_ENEMY, need, timestamp)
-            )
-            kalman_centers.sort(key=lambda p: np.hypot(p[0] - cx, p[1] - cy))
-            for (px, py) in kalman_centers[:need]:
-                if np.hypot(px - cx, py - cy) < 2 * r:
-                    if all(np.hypot(px - ex, py - ey) > 0.5 * r for (ex, ey) in centers):
-                        centers.append((px, py))
-                    if len(centers) >= n_est:
-                        break
+        # ========== SEPARAÇÃO PROVISÓRIA (espalhamento horizontal) ==========
+        if self.var_d:
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Gerando centros e máscaras PROVISÓRIAS (apenas para estudo).")
 
-        return centers[:n_est]
+        centers = []
+        step = (2 * r) / (n_est + 1) if n_est > 1 else 0
+        for i in range(n_est):
+            offset_x = -r + (i + 1) * step
+            centers.append((cx + offset_x, cy))
+
+        # ========== GERA E SALVA AS MÁSCARAS INDIVIDUAIS ==========
+        individual_masks = []
+        for i in range(n_est):
+            mask_ind = np.zeros(img_shape[:2], dtype=np.uint8)
+            cv2.circle(mask_ind, (int(centers[i][0]), int(centers[i][1])),
+                    int(r * 0.8), 255, -1)
+            individual_masks.append(mask_ind)
+
+            # Recorta a máscara individual na ROI e salva
+            mask_ind_roi = mask_ind[y1:y2, x1:x2]
+            ind_filename = os.path.join(full_save_path, f"{blob_id}_mask_ind_{i+1}.png")
+            cv2.imwrite(ind_filename, mask_ind_roi)
+            if self.var_d:
+                print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara Individual {i+1} salva em {ind_filename}")
+
+        # ========== FINALIZAÇÃO ==========
+        if self.var_d:
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centros retornados (provisórios): {}".format(centers))
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Finalizando tratamento. Todas as imagens foram salvas em {}".format(full_save_path))
+
+        # Retorna a lista de centros e a lista de máscaras individuais (full-frame)
+        return centers, individual_masks
 
 
     def _GeometricCollisionSplit(self, imgHSV, cnt, cx, cy, r, n_est, winSize, timestamp,
