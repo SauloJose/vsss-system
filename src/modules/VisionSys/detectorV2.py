@@ -77,6 +77,8 @@ class VisionSystem:
         self.fieldWidth = 150                   # largura do campo (cm)
         self.fieldHeight = 130                  # altura do campo (cm)
         self.prop_px_cm = 1                     # proporção pixel → cm (atualizada na detecção)
+        self.prop_px_cm_filtered = 1            # Filtro de média móvel
+        self.prop_alpha = 0.9                   # Fator de suavização da média móvel da proporção
         self.prop_px_cm_virtual = 3             # proporção na imagem virtual (fixa)
         self.min_diag = (7.5 / 4) * np.sqrt(2) * self.prop_px_cm
 
@@ -506,23 +508,31 @@ class VisionSystem:
         self.enemiesCount = 0
         self.fieldDetectionFailCount  = 0
 
-        # Flags de detecção do frame atual (não mexe no histórico de posições)
-        for bot in self.allyTeam:
-            bot.detected = False
-            bot.possessionBall = False
-        for bot in self.enemyTeam:
-            bot.detected = False
-            bot.possessionBall = False
-        if hasattr(self.ball, 'detected'):
-            self.ball.detected = False
+        if self.emulatorMode == MODE_IMAGE:
+            for bot in self.allyTeam:
+                bot.detected = False
+                bot.possessionBall = False
+            for bot in self.enemyTeam:
+                bot.detected = False
+                bot.possessionBall = False
+            if hasattr(self.ball, 'detected'):
+                self.ball.detected = False
+            # também podemos resetar os contadores de perdidos nesse modo
+            self.missed_frames_robots.clear()
+            self.missed_frames_ball = 0
+            self.robot_kalman_reset_flags.clear()
+            self.ball_kalman_reset_flag = False
+        # Se for contínuo, NÃO mexe em detected, para a tolerância funcionar
+
 
         if hasattr(self, 'virtual'):
             self.virtualImg = self.virtual.copy()
 
         self._threads = [t for t in self._threads if t.is_alive()]
 
-        self.colorTree.clear()
-        self.SetTreeColorDefault()
+        # Comentado pois estava causando bug de atribuição dos robôs
+        #self.colorTree.clear()
+        #self.SetTreeColorDefault()
 
     def GetObjects(self):
         '''Retorna dict com aliados, inimigos, bola, campo e timestamp.'''
@@ -740,8 +750,12 @@ class VisionSystem:
         return bin_Reduce, img_Reduce, cooVetor
 
     def ConvertMeasures(self, w_cm, w_px):
-        '''Atualiza a proporção px/cm (self.prop_px_cm) usada em todo o pipeline.'''
-        self.prop_px_cm = w_px / w_cm
+        raw = w_px / w_cm
+        if self.prop_px_cm_filtered == 0:
+            self.prop_px_cm_filtered = raw
+        else:
+            self.prop_px_cm_filtered = self.prop_alpha * raw + (1 - self.prop_alpha) * self.prop_px_cm_filtered
+        self.prop_px_cm = self.prop_px_cm_filtered  # ou manter separado, mas usamos o filtrado para as decisões
         self.min_diag = (7.5 / 4) * np.sqrt(2) * self.prop_px_cm
 
     def ListPlayers(self, teamList):
@@ -1570,6 +1584,7 @@ class VisionSystem:
 
             self.ball.setImgPosition(xb, yb, rb)
             self.ball.status = True
+            self.missed_frames_ball = 0 
 
             rb = int(rb / self.prop_px_cm)
             xb = int(xb)
@@ -1594,7 +1609,10 @@ class VisionSystem:
                             ((xv + int(self.ball.direction[0])), (yv + int(self.ball.direction[1]))), 
                             (0, 255, 255), 2)
         else:
-            self.ball.status = False
+            self.missed_frames_ball +=1 
+            if self.missed_frames_ball > self.MAX_MISSED_FRAMES_BALL:
+                self.ball.status = False
+                self.ball_kalman_reset_flag = True
 
     def DetectPlayers(self, img, timestamp, dbg=False, isT=False, hsv_img=None):
         '''
@@ -1663,12 +1681,12 @@ class VisionSystem:
         px_cm = self.prop_px_cm
 
         # Seleção dos kernels conforme a resolução
-        if px_cm <= 3.0:
+        if px_cm <= 3.2:
             kernel_erode = self.struct_ellipse3
             kernel_close = self.struct_rect5
             it_erode = 2
             faixa = "1/3 (px/cm <= 3.0)"
-        elif px_cm <= 4.0:
+        elif px_cm <= 4.2:
             kernel_erode = self.struct_ellipse5
             kernel_close = self.struct_rect5
             it_erode = 1
@@ -2653,6 +2671,7 @@ class VisionSystem:
         # ===========================
         # RESET ESTADO E TEMPOS
         # ===========================
+        #
         self.ResetExecutionState()
         
         if not hasattr(self, 'lastMajorTime') or self.lastMajorTime == 0:
