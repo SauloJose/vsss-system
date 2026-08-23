@@ -34,8 +34,8 @@ class VisionSystem:
         self.bmk = Benchmark()
 
         # Watchdog: frames perdidos antes de resetar o Kalman
-        self.MAX_MISSED_FRAMES_BALL = 120   # 2s a 60 FPS, 4s a 30 FPS
-        self.MAX_MISSED_FRAMES_ROBOT = 120
+        self.MAX_MISSED_FRAMES_BALL = 180   # 2s a 60 FPS, 4s a 30 FPS
+        self.MAX_MISSED_FRAMES_ROBOT = 180
         self.missed_frames_ball = 0
         self.ball_kalman_reset_flag = False
         self.missed_frames_robots = {}
@@ -43,10 +43,10 @@ class VisionSystem:
 
 
         ## Variável de debug temporária
-        self.var_d = True 
+        self.var_d = False 
 
         # Gating de distância – rejeita saltos implausíveis
-        self.MAX_JUMP_CM = 60.0
+        self.MAX_JUMP_CM = 30.0
 
         self._count: int = 0
         self._firstTimeExec: int = 0
@@ -150,6 +150,18 @@ class VisionSystem:
         self.Thrashhold = 235
         self.pixelWidth = 1
 
+
+        ##=========================================================
+        # Helpers de pixel 
+        self.winSize = 0 
+        self.half_win = 0
+        self.playerRadius = 0
+        self.mainColorRadius = 0
+        self.secColorRadius = 0
+        self.single_area = 0
+        self.NOISE_RADIUS_MIN = 0 
+
+        ##=========================================================
         # ==============================================================
         # 5. IMAGENS E BUFFERS DE DEBUG
         # ==============================================================
@@ -189,9 +201,7 @@ class VisionSystem:
         self.objectsLightColor = np.array([179, 255, 255])
 
         # Raios (serão definidos em tempo de execução)
-        self.playerRadius = 0
-        self.mainColorRadius = 0
-        self.secColorRadius = 0
+
 
         # Limites HSV para aliados e inimigos (preenchidos no ToMineData)
         self.ally_lower_bound = None
@@ -1493,7 +1503,14 @@ class VisionSystem:
                             else img.copy())
 
         # ---------------------------------------------------------
-        
+        ## Atualização dos Helpers:
+        self.winSize = int(18 * self.prop_px_cm)
+        self.half_win = self.winSize // 2
+        self.playerRadius = 5.3033 * self.prop_px_cm
+        self.mainColorRadius = 4.1926 * self.prop_px_cm
+        self.single_area = 56.25 * (self.prop_px_cm ** 2)
+        self.NOISE_RADIUS_MIN = 0.2 * self.playerRadius
+
         return resultado_dp_cm if campo_detectado else -1
 
     #Detectar a imagem da bola na imagem
@@ -1669,20 +1686,20 @@ class VisionSystem:
         if self.var_d:
             print(f"[VS][DEBUG][DETECPLAYER]: Faixa {faixa} - px/cm atual: {px_cm:.2f} - Erosão: {kernel_erode.shape[0]}x{kernel_erode.shape[1]}, Fechamento: {kernel_close.shape[0]}x{kernel_close.shape[1]}")
             
-            cv2.imshow("Mascara dos objetos", obj_mask)
-            cv2.imshow("Mascara dos objetos fechados", closed_mask)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+            #cv2.imshow("Mascara dos objetos", obj_mask)
+            #cv2.imshow("Mascara dos objetos fechados", closed_mask)
+            #cv2.waitKey(0)
+            #cv2.destroyAllWindows()
         # ===================================================================
+        # ======== HELPERS em pixels
+        winSize = self.winSize
+        half_win = self.half_win
+        playerRadius = self.playerRadius
+        mainColorRadius = self.mainColorRadius
+        single_area = self.single_area
+        NOISE_RADIUS_MIN =self.NOISE_RADIUS_MIN
 
-        # HELPERS em pixels
-        winSize = int(18 * self.prop_px_cm)
-        half_win = winSize // 2
-        playerRadius = 5.3033 * self.prop_px_cm
-        mainColorRadius = 4.1926 * self.prop_px_cm
-        single_area = 56.25 * (self.prop_px_cm ** 2)
-        NOISE_RADIUS_MIN = 0.2 * playerRadius
-
+        #===========================================================
         if self.var_d:
             txt = f"[VS][DEBUG][DETECPLAYER]: \n - px/cm= {self.prop_px_cm:.2f} \n - Largura da Janela (18cm) = {winSize:.2f} px \n - Raio do Player Previsto = {playerRadius:.2f} px \n - Raio da cor Principal = {mainColorRadius} px \n - Area unitaria de um player = {single_area:.2f} px²"
             print(txt)
@@ -1829,12 +1846,16 @@ class VisionSystem:
         ally_ratio = ally_area / total_area
         enemy_ratio = enemy_area / total_area
         
-        if ally_ratio > 0.4:
-            team_is_enemy = False
-        elif enemy_ratio > 0.4:
-            team_is_enemy = True
-        else:
+        if ally_area == 0 and enemy_area == 0:
             return None
+        if ally_area >= enemy_area:
+            if ally_ratio < 0.4:
+                return None
+            team_is_enemy = False
+        else:
+            if enemy_ratio < 0.4:
+                return None
+            team_is_enemy = True
 
         # Etapa 6 - Seleciona a máscara correspondente ao time definido e encontra
         # o maior contorno externo. Em seguida, calcula o círculo mínimo envolvente
@@ -1892,13 +1913,27 @@ class VisionSystem:
                             x_offset=0, y_offset=0, imgHSV=None, img=None,
                             save_path="src/data/study/"):
         """
-        (VERSÃO DE ESTUDO - SEM ALGORITMO DE SEPARAÇÃO AINDA)
-        Recebe um blob fundido (contorno) e estima quantos robôs estão ali.
-        Retorna centros (estimados) e uma máscara full-frame para cada robô.
+        Resolve um blob fundido (colisão de múltiplos robôs) usando K-Means para
+        encontrar os centros individuais.
 
-        Agora as imagens de debug são salvas em disco (em save_path) em vez de exibidas com cv2.imshow.
+        Parâmetros:
+            img_shape: tupla (altura, largura) da imagem original.
+            cnt: contorno do blob (em coordenadas full-frame).
+            cx, cy: centro aproximado do blob (full-frame).
+            r: raio aproximado do blob (em pixels).
+            n_est: número estimado de robôs dentro deste blob.
+            winSizeBlob: tamanho da janela (não usado diretamente, mantido para compatibilidade).
+            timestamp: timestamp (para identificação única).
+            x_offset, y_offset: offset da janela (não usado, mantido para compatibilidade).
+            imgHSV: imagem HSV full-frame (opcional, para debug).
+            img: imagem RGB full-frame (opcional, para debug).
+            save_path: diretório onde salvar as imagens de debug.
+
+        Retorna:
+            centers: lista de tuplas (x, y) com os centros encontrados (full-frame).
+            individual_masks: lista de máscaras binárias full-frame, uma para cada robô.
         """
-        # ========== INÍCIO DO DEBUG ==========
+        # ==================== INÍCIO DO DEBUG ====================
         if self.var_d:
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Iniciando tratamento da colisão para encontrar centros.")
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Estimativa de {} robôs neste blob.".format(n_est))
@@ -1908,12 +1943,10 @@ class VisionSystem:
         full_save_path = os.path.join(os.getcwd(), save_path)
         os.makedirs(full_save_path, exist_ok=True)
 
-        # Gera um identificador único para este blob (baseado no timestamp e nas coordenadas)
-        # timestamp pode ser float; usamos uma string com 6 casas decimais para evitar conflitos
-        ts_str = f"{timestamp:.6f}".replace('.', '_')
-        blob_id = f"blob_{ts_str}_cx{int(cx)}_cy{int(cy)}"
+        # Identificador único para este blob
+        blob_id = f"blob__cx{int(cx)}_cy{int(cy)}"
 
-        # Etapa 1 - Obtém a bounding box do contorno para recortar a região de interesse (ROI)
+        # ==================== ETAPA 1: BOUNDING BOX DO BLOB ====================
         x, y, w, h = cv2.boundingRect(cnt)
         margin = 5
         x1 = max(0, x - margin)
@@ -1924,11 +1957,11 @@ class VisionSystem:
         if self.var_d:
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Bounding Box do Blob: ({}, {}) -> ({}, {})".format(x1, y1, x2, y2))
 
-        # Etapa 2 - Cria uma máscara full-frame do blob
+        # ==================== ETAPA 2: MÁSCARA FULL-FRAME DO BLOB ====================
         mask_full = np.zeros(img_shape[:2], dtype=np.uint8)
         cv2.drawContours(mask_full, [cnt], -1, 255, -1)
 
-        # Etapa 3 - Recorta as ROIs
+        # ==================== ETAPA 3: RECORTAR AS ROIS ====================
         mask_roi = mask_full[y1:y2, x1:x2]
         hsv_roi = None
         img_roi = None
@@ -1938,273 +1971,104 @@ class VisionSystem:
         if imgHSV is not None:
             hsv_roi = imgHSV[y1:y2, x1:x2]
 
-        # ========== SALVA AS IMAGENS DA ROI ==========
-        # Salva a imagem RGB (se disponível)
-        if img_roi is not None:
+        # ==================== SALVA IMAGENS DE DEBUG (JÁ EXISTENTES) ====================
+        if img_roi is not None and self.var_d:
             rgb_filename = os.path.join(full_save_path, f"{blob_id}_rgb.png")
             cv2.imwrite(rgb_filename, img_roi)
             if self.var_d:
                 print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Imagem RGB salva em {rgb_filename}")
 
-        # Salva a máscara do blob (objeto escuro)
-        mask_filename = os.path.join(full_save_path, f"{blob_id}_mask_blob.png")
-        cv2.imwrite(mask_filename, mask_roi)
         if self.var_d:
+            mask_filename = os.path.join(full_save_path, f"{blob_id}_mask_blob.png")
+            cv2.imwrite(mask_filename, mask_roi)
             print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara do Blob salva em {mask_filename}")
 
-        # ========== SEPARAÇÃO PROVISÓRIA (espalhamento horizontal) ==========
+        # ====================================================================
+        # ====== NOVO: LOCALIZAÇÃO DOS CENTROS USANDO K-MEANS ======
+        # ====================================================================
         if self.var_d:
-            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Gerando centros e máscaras PROVISÓRIAS (apenas para estudo).")
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Aplicando K-Means para encontrar os centros dos robôs.")
 
-        centers = []
-        step = (2 * r) / (n_est + 1) if n_est > 1 else 0
-        for i in range(n_est):
-            offset_x = -r + (i + 1) * step
-            centers.append((cx + offset_x, cy))
+        # 1. Obter todos os pixels pertencentes ao blob (pontos não-zero da máscara)
+        pts = cv2.findNonZero(mask_roi)  # Retorna um array (N, 1, 2) ou None
 
-        # ========== GERA E SALVA AS MÁSCARAS INDIVIDUAIS ==========
-        individual_masks = []
-        for i in range(n_est):
+        if pts is None:
+            # Se não houver pontos (máscara vazia), retorna listas vazias
+            if self.var_d:
+                print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  ATENÇÃO: Máscara do blob vazia. Retornando vazio.")
+            return [], []
+
+        # 2. Converter para o formato exigido pelo K-Means: (N, 2) com float32
+        pts = np.float32(pts).reshape(-1, 2)
+
+        # 3. Definir critérios de parada: 30 iterações ou precisão de 0.1 pixel
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
+
+        # 4. Aplicar K-Means
+        #    - n_est: número de clusters (robôs)
+        #    - tentativas: 10 (para evitar mínimos locais)
+        #    - KMEANS_PP_CENTERS: inicialização inteligente (K-Means++)
+        _, _, centers_roi = cv2.kmeans(pts, n_est, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+
+        # centers_roi é um array (n_est, 2) com as coordenadas (x, y) na ROI
+
+        if self.var_d:
+            print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  K-Means encontrou {len(centers_roi)} centros na ROI.")
+
+        # ==================== CONVERTER CENTROS PARA COORDENADAS GLOBAIS ====================
+        centers = []          # Lista de (cx_global, cy_global)
+        individual_masks = [] # Lista de máscaras full-frame para cada robô
+
+        for c in centers_roi:
+            # c é [x, y] em coordenadas locais da ROI
+            cx_global = int(c[0] + x1)
+            cy_global = int(c[1] + y1)
+            centers.append((cx_global, cy_global))
+
+            # Gera máscara individual (círculo de raio r*0.8 ao redor do centro)
             mask_ind = np.zeros(img_shape[:2], dtype=np.uint8)
-            cv2.circle(mask_ind, (int(centers[i][0]), int(centers[i][1])),
-                    int(r * 0.8), 255, -1)
+            cv2.circle(mask_ind, (cx_global, cy_global), int(r * 0.8), 255, -1)
             individual_masks.append(mask_ind)
 
-            # Recorta a máscara individual na ROI e salva
-            mask_ind_roi = mask_ind[y1:y2, x1:x2]
-            ind_filename = os.path.join(full_save_path, f"{blob_id}_mask_ind_{i+1}.png")
-            cv2.imwrite(ind_filename, mask_ind_roi)
             if self.var_d:
+                print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centro K-Means: global ({cx_global}, {cy_global})")
+
+        # ==================== SALVAR IMAGEM DE DEBUG COM OS CENTROS ====================
+        # Criamos uma imagem colorida para debug: se tivermos img_roi, usamos ela,
+        # senão, usamos a máscara em escala de cinza convertida para BGR.
+        if img_roi is not None:
+            debug_img = img_roi.copy()
+        else:
+            # Converte a máscara para 3 canais (escala de cinza -> BGR)
+            debug_img = cv2.cvtColor(mask_roi, cv2.COLOR_GRAY2BGR)
+
+        # Desenha um círculo vermelho em cada centro encontrado (coordenadas locais)
+        for c in centers_roi:
+            cx_roi, cy_roi = int(c[0]), int(c[1])
+            cv2.circle(debug_img, (cx_roi, cy_roi), int(r * 0.4), (0, 0, 255), 2)  # Vermelho
+            # Opcional: coloca um ponto central
+            cv2.circle(debug_img, (cx_roi, cy_roi), 2, (0, 0, 255), -1)
+
+        # Salva a imagem com os centros
+        centers_filename = os.path.join(full_save_path, f"{blob_id}_centers_kmeans.png")
+        cv2.imwrite(centers_filename, debug_img)
+        if self.var_d:
+            print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Imagem com centros salva em {centers_filename}")
+
+        # ==================== SALVAR MÁSCARAS INDIVIDUAIS (como antes) ====================
+        for i, (cx_g, cy_g) in enumerate(centers):
+            mask_ind_roi = individual_masks[i][y1:y2, x1:x2]
+            ind_filename = os.path.join(full_save_path, f"{blob_id}_mask_ind_{i+1}.png")
+            if self.var_d:
+                cv2.imwrite(ind_filename, mask_ind_roi)
                 print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara Individual {i+1} salva em {ind_filename}")
 
-        # ========== FINALIZAÇÃO ==========
+        # ==================== FINALIZAÇÃO ====================
         if self.var_d:
-            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centros retornados (provisórios): {}".format(centers))
+            print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centros retornados: {}".format(centers))
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Finalizando tratamento. Todas as imagens foram salvas em {}".format(full_save_path))
 
-        # Retorna a lista de centros e a lista de máscaras individuais (full-frame)
         return centers, individual_masks
-
-
-    def _GeometricCollisionSplit(self, imgHSV, cnt, cx, cy, r, n_est, winSize, timestamp,
-                                  x_offset=0, y_offset=0):
-        """
-        Helper privado da PARTE 2 (v2). Implementa o passo 1 (busca
-        geométrica dirigida por robô conhecido) descrito no docstring de
-        ResolveCollisionBlob -- é a peça que substitui a erosão como método
-        PRIMÁRIO de separação do blob fundido.
-
-        Ideia central: em vez de perguntar "quantas manchas dá pra separar
-        aqui dentro" (erosão, cega quanto a identidade), pergunta "cada robô
-        que eu já conheço a cor está aqui dentro?" -- um teste de hipótese
-        por robô, igual ao já usado em DetectBotInRoi/SearchBot, só que
-        repetido para todos os candidatos plausíveis dentro da MESMA ROI do
-        blob fundido.
-
-        `imgHSV` precisa estar no MESMO referencial LOCAL de `cnt`/`cx`/`cy`
-        (o mesmo `imgHSV` recebido por DetectPlayerCandidates) -- ou seja,
-        NÃO é necessariamente self.imgHSV/self.hsv_fieldReduce inteiro, a
-        menos que a janela de detecção seja o campo inteiro com offset
-        (0, 0), como é o caso hoje em DetectPlayers.
-
-        Retorna (centers, claimed_bots):
-            centers: lista de até `n_est` centros (x, y) LOCAIS a `cnt`.
-            claimed_bots: set com os objetos Robot já resolvidos aqui (para
-                uso futuro por quem quiser evitar retrabalho na Parte 3;
-                não é consumido dentro desta função).
-        """
-        H, W = imgHSV.shape[:2]
-
-        # --- ROI de trabalho: bounding box do blob + margem de ~1 robô ---
-        x, y, w, h = cv2.boundingRect(cnt)
-        margin = int(0.6 * winSize)
-        x1 = max(0, x - margin)
-        y1 = max(0, y - margin)
-        x2 = min(W, x + w + margin)
-        y2 = min(H, y + h + margin)
-        if x2 <= x1 or y2 <= y1:
-            return [], set()
-        roi_hsv = imgHSV[y1:y2, x1:x2]
-
-        # --- Gate de sanidade em pixels (equivalente ao MAX_JUMP_CM usado
-        #     no resto do pipeline para gating de posição) ---
-        max_jump_px = max(self.MAX_JUMP_CM * self.prop_px_cm, float(winSize))
-
-        # --- Monta lista de robôs "elegíveis" (T1/T2 já conhecidos) -------
-        # Aliados: cor sempre conhecida (config fixa), então são elegíveis
-        # mesmo sem Kalman inicializado (robô que acabou de entrar em campo).
-        # Inimigos: só elegíveis depois de identificados ao menos uma vez
-        # (bot.colorCar1/colorCar2 cacheados por setColor em frames
-        # anteriores) -- antes disso, caem no fallback de erosão/Kalman.
-        candidates = []  # (priority, bot, team_hsv, primary_hsv, secondary_hsv, pred_local)
-        for team, team_list in ((ID_Team.TEAM_ALLY, self.allyTeam),
-                                 (ID_Team.TEAM_ENEMY, self.enemyTeam)):
-            team_hsv = self.allyColor if team == ID_Team.TEAM_ALLY else self.enemyColor
-            for bot in team_list:
-                primary = getattr(bot, "colorCar1", None)
-                secondary = getattr(bot, "colorCar2", None)
-                if primary is None or secondary is None:
-                    continue
-
-                pred_local = None
-                if getattr(bot, "kalman_initialized", False):
-                    try:
-                        x_pred, y_pred, _ = bot.predict(timestamp)
-                        xg, yg = self.GetImageRealIndice((x_pred, y_pred))
-                        pred_local = (float(xg) - x_offset, float(yg) - y_offset)
-                    except Exception:
-                        pred_local = None
-
-                if pred_local is not None:
-                    dist_to_blob = float(np.hypot(pred_local[0] - cx, pred_local[1] - cy))
-                    # Só entra como candidato "provável" se o Kalman prevê
-                    # esse robô dentro (ou bem perto) do próprio blob fundido.
-                    if dist_to_blob > 2.5 * r + winSize:
-                        continue
-                    priority = dist_to_blob
-                else:
-                    # Sem Kalman (robô novo/cold-start): ainda elegível --
-                    # testado depois dos que têm previsão, sem gate espacial
-                    # prévio (o gate de cor + jump ainda se aplica ao "hit").
-                    priority = 2.5 * r + winSize + 1.0
-
-                candidates.append((priority, bot, team_hsv, primary, secondary, pred_local))
-
-        if not candidates:
-            return [], set()
-
-        # Prioriza robôs cujo Kalman já aponta pra dentro do blob -- são os
-        # melhores palpites de "quem colidiu aqui", testados primeiro.
-        candidates.sort(key=lambda c: c[0])
-
-        centers = []
-        claimed_bots = set()
-        used_local_points = []
-
-        for priority, bot, team_hsv, primary, secondary, pred_local in candidates:
-            if len(centers) >= n_est:
-                break
-
-            hit = self.LocateBotGeometric(roi_hsv, team_hsv, primary, secondary)
-            if hit is None:
-                continue  # T1/T2 desse robô não apareceram nesta ROI
-
-            center_local = (float(hit['center'][0] + x1), float(hit['center'][1] + y1))
-
-            # --- Gate de sanidade (ataca o caso "troca de ID por simetria
-            # de cores"): um hit que bate na cor mas está longe demais de
-            # onde ESTE robô deveria estar é rejeitado -- ele provavelmente
-            # pertence a outro robô com cor parecida/trocada, que vai ser
-            # encontrado (corretamente) em sua própria iteração.
-            if pred_local is not None:
-                jump = np.hypot(center_local[0] - pred_local[0], center_local[1] - pred_local[1])
-                if jump > max_jump_px:
-                    continue
-
-            # --- Evita dois robôs "roubarem" quase o mesmo ponto físico ---
-            if any(np.hypot(center_local[0] - ux, center_local[1] - uy) < 0.4 * r
-                   for (ux, uy) in used_local_points):
-                continue
-
-            centers.append(center_local)
-            used_local_points.append(center_local)
-            claimed_bots.add(bot)
-
-        return centers, claimed_bots
-
-    def _SplitBlobByErosion(self, img_shape, cnt, cx, cy, n_est, winSize):
-        """
-        Helper privado da PARTE 2. Aplica erosão sucessiva na máscara do
-        próprio blob (apenas a região do contorno) até que o número de
-        componentes conectados seja >= n_est. Retorna lista de centros
-        (x, y) no MESMO referencial local de `cnt`.
-        """
-        # Cria máscara da região do blob (apenas o contorno)
-        mask = np.zeros(img_shape[:2], dtype=np.uint8)
-        cv2.drawContours(mask, [cnt], -1, 255, -1)
-
-        # Pega o bounding box para limitar as operações (otimização)
-        x, y, w, h = cv2.boundingRect(cnt)
-        margin = int(0.3 * winSize)
-        x1 = max(0, x - margin)
-        y1 = max(0, y - margin)
-        x2 = min(img_shape[1], x + w + margin)
-        y2 = min(img_shape[0], y + h + margin)
-
-        # Recorta a máscara para a ROI do blob
-        roi_mask = mask[y1:y2, x1:x2]
-        if roi_mask.size == 0:
-            return []
-
-        # Kernel de erosão (pequeno, para não perder a forma)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        current = roi_mask.copy()
-        centers = []
-        max_iter = 25
-        min_area = 5  # área mínima para considerar um componente válido
-
-        for i in range(max_iter):
-            # Encontra componentes conectados (8-conectividade)
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                current, connectivity=8
-            )
-            # Ignora o fundo (label 0)
-            valid = []
-            for l in range(1, num_labels):
-                area = stats[l, cv2.CC_STAT_AREA]
-                if area >= min_area:
-                    valid.append(l)
-            if len(valid) >= n_est:
-                # Pega os centroides dos primeiros n_est componentes
-                # (ordem arbitrária, mas consistente)
-                for l in valid[:n_est]:
-                    cx_roi = centroids[l][0] + x1
-                    cy_roi = centroids[l][1] + y1
-                    centers.append((cx_roi, cy_roi))
-                break
-            # Erosão
-            current = cv2.erode(current, kernel, iterations=1)
-            if cv2.countNonZero(current) == 0:
-                break
-        else:
-            # Se não separou, usa o que tem (mas pode ser insuficiente)
-            if centers:
-                pass  # já temos alguns centros
-            else:
-                # Fallback: pega o centroide do blob inteiro (um só)
-                centers.append((cx, cy))
-
-        return centers
-
-    def _GetKalmanPredictedCenters(self, team, n_needed, timestamp):
-        """
-        Helper privado da PARTE 2. Retorna até n_needed centros PREVISTOS
-        pelo Kalman (predict puro, sem corrigir/atualizar o filtro) para
-        robôs do time indicado que já têm o Kalman inicializado.
-
-        ATENÇÃO (preservado fielmente do código original): o ponto retornado
-        vem de self.GetImageIndice(...), que converte cm -> pixels da IMAGEM
-        VIRTUAL (ver docstring de GetImageIndice), enquanto `cx`/`cy` em
-        ResolveCollisionBlob estão no referencial local da janela de
-        detecção (fieldReduce ou menor). Ou seja, a comparação de distância
-        feita em ResolveCollisionBlob já misturava esses dois referenciais
-        na versão original -- mantive exatamente assim para não alterar o
-        comportamento numérico atual, mas é o primeiro ponto a revisar
-        quando for ajustar esta função com mais cuidado.
-        """
-        team_list = self.allyTeam if team == ID_Team.TEAM_ALLY else self.enemyTeam
-        centers = []
-        for bot in team_list:
-            if bot.kalman_initialized:
-                # Prediz para o timestamp atual (não altera o filtro)
-                x_pred, y_pred, _ = bot.predict(timestamp)
-                # Converte para coordenadas de imagem (pixels)
-                xi, yi = self.GetImageIndice((x_pred, y_pred))
-                centers.append((xi, yi))
-                if len(centers) >= n_needed:
-                    break
-        return centers
-
     # ==========================================================================================
     # PARTE 3/3 -- IDENTIFICAÇÃO DOS CANDIDATOS + ATUALIZAÇÃO DO FILTRO DE KALMAN
     # ==========================================================================================
@@ -2719,18 +2583,10 @@ class VisionSystem:
             curr_missed = self.missed_frames_robots.get(key, 0) + 1
             self.missed_frames_robots[key] = curr_missed
 
-            if curr_missed <= self.MAX_MISSED_FRAMES_ROBOT:
-                # Fallback: Predição do EKF (mantém movimento suave)
-                # bot.predict(t) retorna (x, y, theta) preditos pelo modelo
-                pred_x, pred_y, pred_theta = bot.predict(timestamp)
-                
-                # Atualiza visualmente sem tocar no estado do filtro
-                bot.SetPosition(pred_x, pred_y, pred_theta, timestamp)
-                bot.setStatus(True) # Mantém visualmente ativo
-            else:
-                # Perda Real: Desliga e marca para reset
-                bot.setStatus(False)
+            if curr_missed > self.MAX_MISSED_FRAMES_ROBOT:
+                # Perda real: marca o Kalman para reset na próxima detecção
                 self.robot_kalman_reset_flags[key] = True
+                bot.detected = False
 
     def _ProcessROIForRobots(self, roi_img, roi_rect, timestamp, debug=False):
         """

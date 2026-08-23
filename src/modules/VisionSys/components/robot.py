@@ -57,6 +57,10 @@ class Robot:
         self.kalman_last_time = None
         self._init_kalman()
 
+        # Controle de falhas para resetar o Kalman
+        self.frames_missed = 0
+        self.max_frames_missed = 1000 #após 100 frames o kalman reinicia
+
     # --------------------------
     # Inicialização do Kalman
     # --------------------------
@@ -357,6 +361,18 @@ class Robot:
         self.lastTimestamp = 0
         self.newTimestamp = 0
         self._init_kalman()
+
+    def reset_kalman(self):
+        """Reinicializa o filtro de Kalman sem perder a posição atual (bruta)."""
+        self.kalman_initialized = False
+        self.kalman_last_time = None
+        self._init_kalman()
+        # Se tiver uma posição bruta, usa ela para reiniciar (opcional)
+        if self.position is not None:
+            self.kalman_state[:2, 0] = [self.position[0], self.position[1]]
+            self.kalman_state[2, 0] = self.theta
+            self.kalman_initialized = True
+            self.kalman_last_time = self.newTimestamp
 
     def resetState(self):
         self.reset()
