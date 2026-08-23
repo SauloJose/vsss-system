@@ -506,33 +506,32 @@ class VisionSystem:
         self.playersCount = 0
         self.alliesCount = 0
         self.enemiesCount = 0
-        self.fieldDetectionFailCount  = 0
+        self.fieldDetectionFailCount = 0
 
+        # ===== Reset condicional ao modo =====
         if self.emulatorMode == MODE_IMAGE:
-            for bot in self.allyTeam:
+            for bot in self.allyTeam + self.enemyTeam:
                 bot.detected = False
                 bot.possessionBall = False
-            for bot in self.enemyTeam:
-                bot.detected = False
-                bot.possessionBall = False
+                bot.frames_missed = 0          # zera contador interno de perdidos
             if hasattr(self.ball, 'detected'):
                 self.ball.detected = False
-            # também podemos resetar os contadores de perdidos nesse modo
-            self.missed_frames_robots.clear()
+            # reset dos contadores da bola
             self.missed_frames_ball = 0
-            self.robot_kalman_reset_flags.clear()
             self.ball_kalman_reset_flag = False
-        # Se for contínuo, NÃO mexe em detected, para a tolerância funcionar
-
+            # opcional: limpar dicionários antigos (caso ainda existam)
+            if hasattr(self, 'missed_frames_robots'):
+                self.missed_frames_robots.clear()
+            if hasattr(self, 'robot_kalman_reset_flags'):
+                self.robot_kalman_reset_flags.clear()
+        # Em modos contínuos (VIDEO/CAM) NÃO mexer em detected nem contadores
 
         if hasattr(self, 'virtual'):
             self.virtualImg = self.virtual.copy()
 
         self._threads = [t for t in self._threads if t.is_alive()]
 
-        # Comentado pois estava causando bug de atribuição dos robôs
-        #self.colorTree.clear()
-        #self.SetTreeColorDefault()
+        # A árvore de cores NÃO é limpa entre frames (persiste)
 
     def GetObjects(self):
         '''Retorna dict com aliados, inimigos, bola, campo e timestamp.'''
@@ -2209,8 +2208,6 @@ class VisionSystem:
 
             if cand["contour"] is not None:
                 cv2.drawContours(self.binaryAllies, [cand["contour"]], -1, 255, -1)
-            else:
-                cv2.circle(self.binaryAllies, (int(cand["xi"]), int(cand["yi"])), int(cand["ri"]), 255, -1)
 
             self.DrawPlayerCircle(self.frameResult, bot)
             if debug:
@@ -2222,7 +2219,20 @@ class VisionSystem:
             self._ally_last_pos[bot_id] = (cand["xcm"], cand["ycm"])
             self.alliesCount += 1
 
-
+        # ================= WATCHDOG (apenas em modos contínuos) =================
+        # Aplica tolerância a frames perdidos; só executa se NÃO for modo imagem.
+        if self.emulatorMode != MODE_IMAGE:
+            for bot in self.allyTeam + self.enemyTeam:
+                if bot.detected:   # foi detectado neste frame (setStatus(True) foi chamado)
+                    bot.frames_missed = 0
+                else:
+                    bot.frames_missed += 1
+                    if bot.frames_missed > bot.max_frames_missed:
+                        # Perda real: marca como não detectado e reseta o Kalman
+                        bot.detected = False
+                        bot.reset_kalman()   # reinicia o filtro (preserva posição bruta)
+                        # Opcional: bot.frames_missed = 0  # ou mantém para não resetar repetidamente
+                        
     def IdentifyCandidateByColor(self, cand, imgHSV, main_color):
         """
         Utilitário de CONSULTA (não altera nada) para a PARTE 3 -- é o ponto
