@@ -1956,13 +1956,6 @@ class VisionSystem:
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Estimativa de {} robôs neste blob.".format(n_est))
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centro aproximado ({:.1f}, {:.1f}) e Raio {:.1f} px".format(cx, cy, r))
 
-        # Cria o diretório de saída se não existir
-        full_save_path = os.path.join(os.getcwd(), save_path)
-        os.makedirs(full_save_path, exist_ok=True)
-
-        # Identificador único para este blob
-        blob_id = f"blob__cx{int(cx)}_cy{int(cy)}"
-
         # ==================== ETAPA 1: BOUNDING BOX DO BLOB ====================
         x, y, w, h = cv2.boundingRect(cnt)
         margin = 5
@@ -1988,61 +1981,36 @@ class VisionSystem:
         if imgHSV is not None:
             hsv_roi = imgHSV[y1:y2, x1:x2]
 
-        # ==================== SALVA IMAGENS DE DEBUG (JÁ EXISTENTES) ====================
-        if img_roi is not None and self.var_d:
-            rgb_filename = os.path.join(full_save_path, f"{blob_id}_rgb.png")
-            cv2.imwrite(rgb_filename, img_roi)
-            if self.var_d:
-                print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Imagem RGB salva em {rgb_filename}")
-
-        if self.var_d:
-            mask_filename = os.path.join(full_save_path, f"{blob_id}_mask_blob.png")
-            cv2.imwrite(mask_filename, mask_roi)
-            print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara do Blob salva em {mask_filename}")
-
         # ====================================================================
-        # ====== NOVO: LOCALIZAÇÃO DOS CENTROS USANDO K-MEANS ======
+        # ====== LOCALIZAÇÃO DOS CENTROS USANDO K-MEANS ======
         # ====================================================================
         if self.var_d:
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Aplicando K-Means para encontrar os centros dos robôs.")
 
-        # 1. Obter todos os pixels pertencentes ao blob (pontos não-zero da máscara)
-        pts = cv2.findNonZero(mask_roi)  # Retorna um array (N, 1, 2) ou None
+        # 1. Obter todos os pixels pertencentes ao blob
+        pts = cv2.findNonZero(mask_roi)
 
         if pts is None:
-            # Se não houver pontos (máscara vazia), retorna listas vazias
             if self.var_d:
                 print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  ATENÇÃO: Máscara do blob vazia. Retornando vazio.")
             return [], []
 
-        # 2. Converter para o formato exigido pelo K-Means: (N, 2) com float32
         pts = np.float32(pts).reshape(-1, 2)
-
-        # 3. Definir critérios de parada: 30 iterações ou precisão de 0.1 pixel
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
-
-        # 4. Aplicar K-Means
-        #    - n_est: número de clusters (robôs)
-        #    - tentativas: 10 (para evitar mínimos locais)
-        #    - KMEANS_PP_CENTERS: inicialização inteligente (K-Means++)
         _, _, centers_roi = cv2.kmeans(pts, n_est, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
-
-        # centers_roi é um array (n_est, 2) com as coordenadas (x, y) na ROI
 
         if self.var_d:
             print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  K-Means encontrou {len(centers_roi)} centros na ROI.")
 
         # ==================== CONVERTER CENTROS PARA COORDENADAS GLOBAIS ====================
-        centers = []          # Lista de (cx_global, cy_global)
-        individual_masks = [] # Lista de máscaras full-frame para cada robô
+        centers = []
+        individual_masks = []
 
         for c in centers_roi:
-            # c é [x, y] em coordenadas locais da ROI
             cx_global = int(c[0] + x1)
             cy_global = int(c[1] + y1)
             centers.append((cx_global, cy_global))
 
-            # Gera máscara individual (círculo de raio r*0.8 ao redor do centro)
             mask_ind = np.zeros(img_shape[:2], dtype=np.uint8)
             cv2.circle(mask_ind, (cx_global, cy_global), int(r * 0.8), 255, -1)
             individual_masks.append(mask_ind)
@@ -2050,42 +2018,51 @@ class VisionSystem:
             if self.var_d:
                 print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centro K-Means: global ({cx_global}, {cy_global})")
 
-        # ==================== SALVAR IMAGEM DE DEBUG COM OS CENTROS ====================
-        # Criamos uma imagem colorida para debug: se tivermos img_roi, usamos ela,
-        # senão, usamos a máscara em escala de cinza convertida para BGR.
-        if img_roi is not None:
-            debug_img = img_roi.copy()
-        else:
-            # Converte a máscara para 3 canais (escala de cinza -> BGR)
-            debug_img = cv2.cvtColor(mask_roi, cv2.COLOR_GRAY2BGR)
-
-        # Desenha um círculo vermelho em cada centro encontrado (coordenadas locais)
-        for c in centers_roi:
-            cx_roi, cy_roi = int(c[0]), int(c[1])
-            cv2.circle(debug_img, (cx_roi, cy_roi), int(r * 0.4), (0, 0, 255), 2)  # Vermelho
-            # Opcional: coloca um ponto central
-            cv2.circle(debug_img, (cx_roi, cy_roi), 2, (0, 0, 255), -1)
-
-        # Salva a imagem com os centros
-        centers_filename = os.path.join(full_save_path, f"{blob_id}_centers_kmeans.png")
-        cv2.imwrite(centers_filename, debug_img)
+        # ==================== SALVAR IMAGENS DE DEBUG (SOMENTE SE ATIVO) ====================
         if self.var_d:
+            # Cria diretório uma única vez
+            full_save_path = os.path.join(os.getcwd(), save_path)
+            os.makedirs(full_save_path, exist_ok=True)
+            blob_id = f"blob__cx{int(cx)}_cy{int(cy)}"
+
+            # Salva imagem RGB (se disponível)
+            if img_roi is not None:
+                rgb_filename = os.path.join(full_save_path, f"{blob_id}_rgb.png")
+                cv2.imwrite(rgb_filename, img_roi)
+                print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Imagem RGB salva em {rgb_filename}")
+
+            # Salva máscara do blob
+            mask_filename = os.path.join(full_save_path, f"{blob_id}_mask_blob.png")
+            cv2.imwrite(mask_filename, mask_roi)
+            print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara do Blob salva em {mask_filename}")
+
+            # Cria imagem de debug com os centros marcados
+            if img_roi is not None:
+                debug_img = img_roi.copy()
+            else:
+                debug_img = cv2.cvtColor(mask_roi, cv2.COLOR_GRAY2BGR)
+
+            for c in centers_roi:
+                cx_roi, cy_roi = int(c[0]), int(c[1])
+                cv2.circle(debug_img, (cx_roi, cy_roi), int(r * 0.4), (0, 0, 255), 2)
+                cv2.circle(debug_img, (cx_roi, cy_roi), 2, (0, 0, 255), -1)
+
+            centers_filename = os.path.join(full_save_path, f"{blob_id}_centers_kmeans.png")
+            cv2.imwrite(centers_filename, debug_img)
             print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Imagem com centros salva em {centers_filename}")
 
-        # ==================== SALVAR MÁSCARAS INDIVIDUAIS (como antes) ====================
-        for i, (cx_g, cy_g) in enumerate(centers):
-            mask_ind_roi = individual_masks[i][y1:y2, x1:x2]
-            ind_filename = os.path.join(full_save_path, f"{blob_id}_mask_ind_{i+1}.png")
-            if self.var_d:
+            # Salva máscaras individuais
+            for i, (cx_g, cy_g) in enumerate(centers):
+                mask_ind_roi = individual_masks[i][y1:y2, x1:x2]
+                ind_filename = os.path.join(full_save_path, f"{blob_id}_mask_ind_{i+1}.png")
                 cv2.imwrite(ind_filename, mask_ind_roi)
                 print(f"[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Máscara Individual {i+1} salva em {ind_filename}")
 
-        # ==================== FINALIZAÇÃO ====================
-        if self.var_d:
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Centros retornados: {}".format(centers))
             print("[VS][DEBUG][DETECPLAYER][ResolveCollisionBlob]:  Finalizando tratamento. Todas as imagens foram salvas em {}".format(full_save_path))
 
         return centers, individual_masks
+    
     # ==========================================================================================
     # PARTE 3/3 -- IDENTIFICAÇÃO DOS CANDIDATOS + ATUALIZAÇÃO DO FILTRO DE KALMAN
     # ==========================================================================================
