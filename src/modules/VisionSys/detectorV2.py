@@ -47,6 +47,7 @@ class VisionSystem:
 
         # Gating de distância – rejeita saltos implausíveis
         self.MAX_JUMP_CM = 30.0
+        self.ROBOT_RECOVERY_ROI_CM = 30.0
 
         self._count: int = 0
         self._firstTimeExec: int = 0
@@ -1139,16 +1140,16 @@ class VisionSystem:
     # busca guiadas pelo Kalman sigam exatamente o mesmo procedimento geométrico.
     TAG_L_CM = 7.5              # L (cm) - FIXO, não modificar
     TAG_ALPHA = np.arctan(1.0 / 3.0)   # ângulo fixo entre o eixo do time e as tags T1/T2
-    TAG_WIN = 4                 # meia-janela da amostragem HSV (janela 9x9 => +-4)
+    TAG_WIN = 1                 # meia-janela da amostragem HSV (janela 3x3)
 
     def _RotateVec(self, v, ang):
         ''' rotate(v, ang) conforme passo 4 do protocolo. '''
         c, s = np.cos(ang), np.sin(ang)
         return np.array([v[0] * c - v[1] * s, v[0] * s + v[1] * c])
 
-    def _SampleHsvWindow9(self, roi_hsv_padded, cx, cy, pad=4):
+    def _SampleHsvWindow9(self, roi_hsv_padded, cx, cy, pad=1):
         '''
-        Extrai a média HSV de uma janela 9x9 centrada em (cx, cy), a partir de uma
+        Extrai a mediana HSV de uma janela 3x3 centrada em (cx, cy), a partir de uma
         versão da ROI já com borda replicada (cv2.BORDER_REFLECT, tamanho `pad`),
         garantindo que os índices nunca ultrapassem os limites da imagem original.
         '''
@@ -1165,7 +1166,7 @@ class VisionSystem:
         window = roi_hsv_padded[y1:y2, x1:x2]
         if window.size == 0:
             return None
-        return window.reshape(-1, 3).mean(axis=0)
+        return np.median(window.reshape(-1, 3), axis=0)
 
     def _FindTeamTagBlobs(self, roi_hsv, team_hsv):
         '''
@@ -1337,11 +1338,11 @@ class VisionSystem:
 
         return (xci + r1x, yci + r1y), (xci + r2x, yci + r2y), (dirx, diry)
 
-    def GetHsvMean(self, img_hsv, x, y, kernel=2):
+    def GetHsvMean(self, img_hsv, x, y, kernel=1):
         """
         Retorna a média HSV de uma região quadrada (ex: 3x3) centrada em (x, y).
         kernel=1 → janela 3x3
-        kernel=2 → janela 5x5
+        kernel=1 → janela 3x3
         """
         h, w = img_hsv.shape[:2]
         x, y = int(x), int(y)
@@ -1354,7 +1355,7 @@ class VisionSystem:
         if region.size == 0:
             return np.array([0, 0, 0], dtype=np.float32)
 
-        mean_hsv = region.mean(axis=(0, 1))
+        mean_hsv = np.median(region.reshape(-1, 3), axis=0)
 
         return mean_hsv
     
@@ -2268,30 +2269,74 @@ class VisionSystem:
         # Primeiro, tenta a geometria de tags para cada robô
         for bot, team_enum in targets:
             roi_img, roi_rect = self.PredictRobot([H, W], team_enum, bot.id, timestamp)
-            if roi_img is None or roi_img.size == 0:
+            search_img, search_rect = roi_img, roi_rect
+            if search_img is None or search_img.size == 0:
+                search_img, search_rect = self.PredictRobotRecovery(
+                    [H, W], team_enum, bot.id
+                )
+            if search_img is None or search_img.size == 0:
                 continue
 
             # Tenta detectar via geometria de tags
-            result = self.DetectBotInRoi(roi_img, roi_rect, bot, debug)
+            result = self.DetectBotInRoi(search_img, search_rect, bot, debug)
+            if not result:
+                recovery_img, recovery_rect = self.PredictRobotRecovery(
+                    [H, W], team_enum, bot.id
+                )
+                if recovery_img is not None and recovery_img.size > 0:
+                    result = self.DetectBotInRoi(
+                        recovery_img, recovery_rect, bot, debug
+                    )
+                    search_img, search_rect = recovery_img, recovery_rect
+                    if result and debug:
+                        xr, yr, wr, hr = recovery_rect
+                        cv2.rectangle(
+                            self.frameResult, (xr, yr), (xr + wr, yr + hr),
+                            (255, 0, 255), 1
+                        )
             if result:
                 detected_list.extend(result)
                 if debug:
-                    xr, yr, wr, hr = roi_rect
+                    xr, yr, wr, hr = search_rect
                     cv2.rectangle(self.frameResult, (xr, yr), (xr+wr, yr+hr), (0, 255, 0), 1)
             else:
                 # Se falhou, marca a ROI para processamento via candidatos (colisão)
-                roi_key = (roi_rect[0], roi_rect[1], roi_rect[2], roi_rect[3])
+                roi_key = (search_rect[0], search_rect[1], search_rect[2], search_rect[3])
                 if roi_key not in processed_rois:
                     processed_rois.add(roi_key)
                     # Processa a ROI para detectar todos os robôs ali
-                    roi_results = self._ProcessROIForRobots(roi_img, roi_rect, timestamp, debug)
+                    roi_results = self._ProcessROIForRobots(
+                        search_img, search_rect, timestamp, debug
+                    )
                     if roi_results:
                         detected_list.extend(roi_results)
                         if debug:
-                            xr, yr, wr, hr = roi_rect
+                            xr, yr, wr, hr = search_rect
                             cv2.rectangle(self.frameResult, (xr, yr), (xr+wr, yr+hr), (0, 255, 255), 2)  # amarelo para indicar fallback
 
         return detected_list
+
+    def PredictRobotRecovery(self, img_shape, team: ID_Team, robot_id: ID_Robots):
+        """Cria uma ROI ampla ao redor da última posição medida do robô."""
+        try:
+            team_list = self.allyTeam if team == ID_Team.TEAM_ALLY else self.enemyTeam
+            bot = team_list[robot_id]
+            if not bot.kalman_initialized:
+                return None, None
+
+            x_cm, y_cm = map(float, bot.position)
+            size_cm = self.ROBOT_RECOVERY_ROI_CM
+            roi_cm = (
+                x_cm - size_cm / 2.0,
+                y_cm - size_cm / 2.0,
+                size_cm,
+                size_cm,
+            )
+            roi_rect = self.GetRoiImg(roi_cm, img_shape)
+            x, y, w, h = roi_rect
+            return self.fieldReduce[y:y + h, x:x + w], roi_rect
+        except (IndexError, TypeError, ValueError):
+            return None, None
 
     def DetectBotInRoi(self, roi_img, roi_rect, target_bot, debug=False) -> list:
             """
@@ -2617,10 +2662,11 @@ class VisionSystem:
         # Vamos usar a árvore de cores para identificar o robô e construir o resultado
         results = []
         all_candidates = ally_candidates + enemy_candidates
+        candidate_hsv = getattr(self, "imgHSV", roi_hsv)
         for cand in all_candidates:
             # Identifica pela cor
             main_color = self.allyColor if cand in ally_candidates else self.enemyColor
-            match, Color_p, Color_s = self.IdentifyCandidateByColor(cand, roi_hsv, main_color)
+            match, Color_p, Color_s = self.IdentifyCandidateByColor(cand, candidate_hsv, main_color)
             if match is None:
                 continue
             bot_id = match['robot_id']
@@ -3022,7 +3068,7 @@ class VisionSystem:
                 # Se perdeu por muito tempo, resetamos o robô.
                 # Isso fará o próximo updatePosition reinicializar o Kalman.
                 if missed > self.MAX_MISSED_FRAMES_ROBOT or self.robot_kalman_reset_flags.get(key, False):
-                    bot.reset() 
+                    bot.reset_kalman()
                     self.robot_kalman_reset_flags[key] = False
 
                 # --- Gating de distância (fail-safe, mesmo princípio do DetectPlayers) ---
