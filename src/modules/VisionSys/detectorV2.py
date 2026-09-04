@@ -34,8 +34,8 @@ class VisionSystem:
         self.bmk = Benchmark()
 
         # Watchdog: frames perdidos antes de resetar o Kalman
-        self.MAX_MISSED_FRAMES_BALL = 180   # 2s a 60 FPS, 4s a 30 FPS
-        self.MAX_MISSED_FRAMES_ROBOT = 180
+        self.MAX_MISSED_FRAMES_BALL = 6*60   # 2s a 60 FPS, 4s a 30 FPS
+        self.MAX_MISSED_FRAMES_ROBOT = 6*60
         self.missed_frames_ball = 0
         self.ball_kalman_reset_flag = False
         self.missed_frames_robots = {}
@@ -46,7 +46,7 @@ class VisionSystem:
         self.var_d = False 
 
         # Gating de distância – rejeita saltos implausíveis
-        self.MAX_JUMP_CM = 30.0
+        self.MAX_JUMP_CM = 80.0
         self.ROBOT_RECOVERY_ROI_CM = 30.0
 
         self._count: int = 0
@@ -198,6 +198,11 @@ class VisionSystem:
         self.atk1AllyColor2 = None
         self.atk2AllyColor1 = None
         self.atk2AllyColor2 = None
+
+        self._enemy_last_pos = {}
+        self._ally_last_pos = {}
+        self.missed_frames_robots = {}
+        self.robot_kalman_reset_flags = {}
 
         # Limites globais para objetos
         self.objectsDarkColor = np.array([0, 10, 130])
@@ -394,7 +399,12 @@ class VisionSystem:
         self.robotEnemyG.setTeamColor(self.enemyColor)
 
         # Limites de cor
-        self.ally_lower_bound, self.ally_upper_bound = self.CreateColorBounds(self.allyColor)
+        self.ally_lower_bound, self.ally_upper_bound = self.CreateColorBounds(
+                                                                                self.allyColor, 
+                                                                                hue_tolerance=15,      # Aumentado de 10 para 15
+                                                                                saturation_tolerance=70, # Aumentado de 50 para 70
+                                                                                value_tolerance=70     # Aumentado de 50 para 70
+                                                                            )
         self.enemy_lower_bound, self.enemy_upper_bound = self.CreateColorBounds(self.enemyColor)
 
         #Cor laranja da bola (mesmo tratamento de wrap de Hue, com tolerância menor)
@@ -462,28 +472,91 @@ class VisionSystem:
 
         self._enemy_last_pos = {}
         self._ally_last_pos = {}
+        self.missed_frames_ball = 0
+        self.ball_kalman_reset_flag = False
+        self.missed_frames_robots = {}
+        self.robot_kalman_reset_flags = {}
 
+        self.colorTree = TreeColors()
+        self.SetTreeColorDefault()  # Popula aliados (e inimigos, se necessário)
+
+    
         self.homography_matrix = None
         self.inv_homography_matrix = None
         self.prop_px_cm = 1
+        self.prop_px_cm_filtered = 1
         self.min_diag = (7.5 / 4) * np.sqrt(2) * self.prop_px_cm
 
         self.GPUimg = None
         self.CPUimg = None
-        self.emulatorMode = MODE_IMAGE
+        #self.emulatorMode = MODE_IMAGE
 
         self.frameOrigin = None
         self.ballImg = None
         self.fieldReduce = None
         self.frameResult = None
 
-        self.ResetExecutionState()
+        if hasattr(self, 'virtual') and self.virtual is not None:
+            self.virtualImg = self.virtual.copy()
+
+        self._ResetExecutionStateClean()
         
         # 7. Reconstroi o campo
         self.BuildField()
 
-        # 8. Recaptura cores
-        self.SetTreeColorDefault()
+        # Puxa cores
+        self.ToMineData()
+
+        # Reseta o timer
+        if self.timer is not None:
+            self.timer.reset()
+
+    def _ResetExecutionStateClean(self):
+        '''Versão limpa do ResetExecutionState que não depende do emulatorMode.'''
+        self.frameOrigin = None
+        self.fieldReduce = None
+        self.frameResult = None
+        self.imgReduce = None
+        self.ballImg = None
+        
+        self.binaryObjects = np.zeros((1, 1), dtype=np.uint8)
+        self.binaryPlayers = np.zeros((1, 1), dtype=np.uint8)
+        self.binaryBall = np.zeros((1, 1), dtype=np.uint8)
+        self.binReduceField = np.zeros((1, 1), dtype=np.uint8)
+        self.binField = np.zeros((1, 1), dtype=np.uint8)
+        self.binaryAllies = np.zeros((1, 1), dtype=np.uint8)
+        
+        self.playersWindows = [None, None, None, None, None, None]
+        self.alliesWindows = [None, None, None]
+        self.enimiesWindows = [None, None, None]
+        
+        self.playersCount = 0
+        self.alliesCount = 0
+        self.enemiesCount = 0
+        self.fieldDetectionFailCount = 0
+        
+        # Reseta DETECTED de TODOS os robôs (independente do modo)
+        for bot in self.allyTeam + self.enemyTeam:
+            bot.detected = False
+            bot.possessionBall = False
+            bot.frames_missed = 0
+            # Importante: reseta o Kalman também!
+            bot.reset_kalman()
+        
+        if hasattr(self.ball, 'detected'):
+            self.ball.detected = False
+            self.ball.reset()  # Reseta o Kalman da bola
+        
+        # Reseta contadores
+        self.missed_frames_ball = 0
+        self.ball_kalman_reset_flag = False
+        self.missed_frames_robots.clear()
+        self.robot_kalman_reset_flags.clear()
+        
+        if hasattr(self, 'virtual') and self.virtual is not None:
+            self.virtualImg = self.virtual.copy()
+        
+        self._threads = [t for t in self._threads if t.is_alive()]
 
     def ResetExecutionState(self):
         '''Reseta variáveis temporárias entre frames (preserva robôs/bola/campo/config). Chamar após cada Proc().'''
@@ -572,6 +645,29 @@ class VisionSystem:
             except Exception as e:
                 if self.debug:
                     print(f"[VisSys][GetFrameProtobuff][ERROR] - Erro ao processar bola: {e}")
+
+    def _GetAdaptiveTolerances(self):
+        """
+        Retorna tolerâncias adaptadas com base na resolução atual.
+        Quanto menor a imagem (menor px/cm), maiores as tolerâncias.
+        """
+        px_cm = self.prop_px_cm
+        
+        # Quanto menor o px/cm, maior a tolerância (imagens mais pixeladas)
+        if px_cm < 3.0:
+            # Imagens muito pequenas
+            l_tolerance = 0.10  # ±10%
+            alpha_tolerance_deg = 5.0  # ±5 graus
+        elif px_cm < 4.0:
+            # Imagens médias
+            l_tolerance = 0.06  # ±6%
+            alpha_tolerance_deg = 3.0  # ±3 graus
+        else:
+            # Imagens grandes (boa resolução)
+            l_tolerance = 0.04  # ±4%
+            alpha_tolerance_deg = 2.0  # ±2 graus
+        
+        return l_tolerance, np.deg2rad(alpha_tolerance_deg)
 
         def fill_robot_proto(source_bot, proto_bot):
             # Kalman guarda [x, y, th, vL, vR, w]; protobuf quer [vx, vy] global
@@ -1139,7 +1235,9 @@ class VisionSystem:
     # Usado tanto por DetectBotInRoi quanto por SearchBot, para que as duas vias de
     # busca guiadas pelo Kalman sigam exatamente o mesmo procedimento geométrico.
     TAG_L_CM = 7.5              # L (cm) - FIXO, não modificar
+    TAG_L_TOLERANCE  = 0.5          # Tolerância de erro na medição
     TAG_ALPHA = np.arctan(1.0 / 3.0)   # ângulo fixo entre o eixo do time e as tags T1/T2
+    TAG_ALPHA_TOLERANCE = np.deg2rad(3.0)     # ±3 graus de tolerância
     TAG_WIN = 1                 # meia-janela da amostragem HSV (janela 3x3)
 
     def _RotateVec(self, v, ang):
@@ -1210,67 +1308,101 @@ class VisionSystem:
 
         return np.array([cx, cy], dtype=float), float(theta)
 
-    def _TestBotHypothesis(self, roi_hsv_padded, C, u, primary_hsv, secondary_hsv, dist):
-        '''
-        Passos 5-7: testa a hipótese primária (sem inversão) e, se falhar, a
-        hipótese secundária (invertida 180°). A ordem é MANDATÓRIA.
-        Retorna o vetor `direction` (u ou -u) se alguma hipótese bater, senão None.
-        '''
-        v1 = self._RotateVec(u, +self.TAG_ALPHA)
-        v2 = self._RotateVec(u, -self.TAG_ALPHA)
-
-        # --- Passo 6: hipótese primária ---
-        P1 = C + dist * v1
-        P2 = C + dist * v2
-        hsv_p1 = self._SampleHsvWindow9(roi_hsv_padded, P1[0], P1[1])
-        hsv_p2 = self._SampleHsvWindow9(roi_hsv_padded, P2[0], P2[1])
-
-        if hsv_p1 is not None and hsv_p2 is not None:
-            if self.IsColorMatch(hsv_p1, primary_hsv) and self.IsColorMatch(hsv_p2, secondary_hsv):
-                return u
-
-        # --- Passo 7: hipótese secundária (inversão 180°) ---
-        v1_opp, v2_opp = -v1, -v2
-        P1o = C + dist * v1_opp
-        P2o = C + dist * v2_opp
-        hsv_p1o = self._SampleHsvWindow9(roi_hsv_padded, P1o[0], P1o[1])
-        hsv_p2o = self._SampleHsvWindow9(roi_hsv_padded, P2o[0], P2o[1])
-
-        if hsv_p1o is not None and hsv_p2o is not None:
-            if self.IsColorMatch(hsv_p1o, primary_hsv) and self.IsColorMatch(hsv_p2o, secondary_hsv):
-                return -u
-
+    def _TestBotHypothesis(self, roi_hsv_padded, C, u, primary_hsv, secondary_hsv, dist_base, L_px_nominal):
+        """
+        Passos 5-7: testa múltiplas hipóteses variando L e alpha dentro dos intervalos
+        de confiança. Retorna o vetor `direction` (u ou -u) se alguma hipótese bater.
+        
+        - T1 (primary_hsv) está SEMPRE na posição +alpha (esquerda)
+        - T2 (secondary_hsv) está SEMPRE na posição -alpha (direita)
+        - A única ambiguidade é a rotação de 180° (u ou -u)
+        """
+        # Gerar combinações de L (tamanho) e alpha (ângulo)
+        l_variations = [
+            L_px_nominal * (1 + delta) 
+            for delta in np.linspace(-0.08, 0.08, 5)  # ±8% em 5 passos
+        ]
+        
+        alpha_variations = [
+            self.TAG_ALPHA_NOMINAL + delta_ang
+            for delta_ang in np.linspace(-self.TAG_ALPHA_TOLERANCE, self.TAG_ALPHA_TOLERANCE, 5)
+        ]
+        
+        # Armazenar a melhor hipótese com confiança
+        best_match = None
+        best_confidence = 0.0
+        
+        for L_px in l_variations:
+            dist = L_px * np.sqrt(5) / 4.0
+            
+            for alpha in alpha_variations:
+                v1 = self._RotateVec(u, +alpha)   # direção para T1 (primary)
+                v2 = self._RotateVec(u, -alpha)   # direção para T2 (secondary)
+                
+                # --- Hipótese primária (0°) ----
+                P1 = C + dist * v1
+                P2 = C + dist * v2
+                hsv_p1 = self._SampleHsvWindow9(roi_hsv_padded, P1[0], P1[1])
+                hsv_p2 = self._SampleHsvWindow9(roi_hsv_padded, P2[0], P2[1])
+                
+                match_p1 = hsv_p1 is not None and self.IsColorMatch(hsv_p1, primary_hsv)
+                match_p2 = hsv_p2 is not None and self.IsColorMatch(hsv_p2, secondary_hsv)
+                
+                if match_p1 and match_p2:
+                    return u  # Ambas detectadas → confiança total
+                
+                conf = (1.0 if match_p1 else 0.0) + (1.0 if match_p2 else 0.0)
+                if conf > best_confidence:
+                    best_confidence = conf
+                    best_match = u
+                
+                # --- Hipótese secundária (180°) ----
+                v1_opp, v2_opp = -v1, -v2
+                P1o = C + dist * v1_opp
+                P2o = C + dist * v2_opp
+                hsv_p1o = self._SampleHsvWindow9(roi_hsv_padded, P1o[0], P1o[1])
+                hsv_p2o = self._SampleHsvWindow9(roi_hsv_padded, P2o[0], P2o[1])
+                
+                match_p1o = hsv_p1o is not None and self.IsColorMatch(hsv_p1o, primary_hsv)
+                match_p2o = hsv_p2o is not None and self.IsColorMatch(hsv_p2o, secondary_hsv)
+                
+                if match_p1o and match_p2o:
+                    return -u  # 180° confirmado
+                
+                conf_o = (1.0 if match_p1o else 0.0) + (1.0 if match_p2o else 0.0)
+                if conf_o > best_confidence:
+                    best_confidence = conf_o
+                    best_match = -u
+        
+        # Fallback: se pelo menos uma tag foi detectada (confiança ≥ 1)
+        if best_confidence >= 1.0:
+            if self.debug:
+                print(f"[VisSys][_TestBotHypothesis] - Apenas 1 tag detectada, usando direção inferida: {best_match}")
+            return best_match
+        
         return None
+
 
     def LocateBotGeometric(self, roi_hsv, team_hsv, primary_hsv, secondary_hsv):
         '''
-        Executa o fluxo geométrico completo (passos 1-9 do protocolo) para localizar
-        um robô específico (identificado por team_hsv + primary_hsv + secondary_hsv)
-        dentro de uma ROI já recortada (roi_hsv).
-
-        Retorna dict {'center': (x,y) local à roi_hsv, 'angle': theta, 'direction':
-        (ux,uy), 'contour': contorno da Tag_Time usado} ou None se não encontrado
-        em nenhum blob candidato de tamanho adequado.
+        Executa o fluxo geométrico completo com intervalos de confiança.
         '''
         if roi_hsv is None or roi_hsv.size == 0:
             return None
 
-        # Passo 1: L em pixels
-        L_px = self.TAG_L_CM * self.prop_px_cm
-        # Passo 3: parâmetros geométricos fixos
-        dist = L_px * np.sqrt(5) / 4.0
+        # Passo 1: L nominal em pixels
+        L_px_nominal = self.TAG_L_CM * self.prop_px_cm
 
-        # Passo 2: candidatos a Tag_Time, do maior para o menor blob
+        # Passo 2: candidatos a Tag_Time
         blobs = self._FindTeamTagBlobs(roi_hsv, team_hsv)
         if not blobs:
             return None
 
-        # Janela replicada uma única vez por ROI (evita recomputar por amostra).
         roi_hsv_padded = cv2.copyMakeBorder(
             roi_hsv, self.TAG_WIN, self.TAG_WIN, self.TAG_WIN, self.TAG_WIN, cv2.BORDER_REFLECT
         )
 
-        # Passo 5-7 (com fallback do passo "REGRA DE VALIDAÇÃO": testar outro blob)
+        # Passo 5-7: testar cada blob com intervalos de confiança
         for cnt in blobs:
             centroid_theta = self._BlobCentroidAndTheta(cnt)
             if centroid_theta is None:
@@ -1281,13 +1413,15 @@ class VisionSystem:
             if u[0] < 0:
                 u = -u
 
-            direction = self._TestBotHypothesis(roi_hsv_padded, C, u, primary_hsv, secondary_hsv, dist)
+            direction = self._TestBotHypothesis(
+                roi_hsv_padded, C, u, primary_hsv, secondary_hsv, 
+                L_px_nominal * np.sqrt(5) / 4.0, L_px_nominal
+            )
             if direction is None:
-                continue  # tenta o próximo blob da cor do time (regra de validação)
+                continue
 
-            # Passo 8: centro final do robô
-            robot_center = C + (L_px / 2.0) * direction
-            # Passo 9: ângulo final
+            # Passo 8: centro final do robô (usa L nominal para consistência)
+            robot_center = C + (L_px_nominal / 2.0) * direction
             angle = float(np.arctan2(direction[1], direction[0]))
 
             return {
@@ -1299,14 +1433,10 @@ class VisionSystem:
 
         return None
 
-    def GetCentersColors(self, xci, yci, xmci, ymci, tol=45):
+    def GetCentersColors(self, xci, yci, xmci, ymci, tol_base=45):
         '''
-            Retorna os centros das cores primária e secundária.
-            (xci, yci) são os centros do objeot (coordenadas da imagem)
-            (xmci, ymci) são os centros da cor principal (coordenadas da image)
-            tol = tolerancia da aquisição
+        Retorna os centros das cores primária e secundária com intervalo de confiança.
         '''
-        
         dx = xci - xmci
         dy = yci - ymci
         norm = (dx*dx + dy*dy)**0.5
@@ -1316,12 +1446,21 @@ class VisionSystem:
         dirx = dx / norm
         diry = dy / norm
 
-        # Constantes pré-computadas
+        # Constantes nominais
         L_m = 2.651650429449553
         L_s = 5.303300858899106
-
-        tol_ang = 1 + (tol + 20) / 100.0
-        tol_lin = 1 + tol / 100.0
+        
+        # Ajustar tolerância com base na resolução
+        px_cm = self.prop_px_cm
+        if px_cm < 3.0:
+            tol_factor = 2.0  # Dobra a tolerância para imagens pequenas
+        elif px_cm < 4.0:
+            tol_factor = 1.5
+        else:
+            tol_factor = 1.0
+        
+        tol_ang = 1 + (tol_base + 20) / 100.0 * tol_factor
+        tol_lin = 1 + tol_base / 100.0 * tol_factor
 
         theta = np.arctan2(L_m, L_s) * tol_ang
         k = (L_m*L_m + L_s*L_s)**0.5 * tol_lin
@@ -1329,16 +1468,14 @@ class VisionSystem:
         cos_t = np.cos(theta)
         sin_t = np.sin(theta)
 
-        # Rotação manual
         r1x = k * (dirx*cos_t + diry*sin_t)
         r1y = k * (-dirx*sin_t + diry*cos_t)
-
         r2x = k * (dirx*cos_t - diry*sin_t)
         r2y = k * (dirx*sin_t + diry*cos_t)
 
         return (xci + r1x, yci + r1y), (xci + r2x, yci + r2y), (dirx, diry)
 
-    def GetHsvMean(self, img_hsv, x, y, kernel=1):
+    def GetHsvMean(self, img_hsv, x, y, kernel=2):
         """
         Retorna a média HSV de uma região quadrada (ex: 3x3) centrada em (x, y).
         kernel=1 → janela 3x3
@@ -1729,7 +1866,7 @@ class VisionSystem:
         raw_contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         # Filtra por área mínima (20% da área de um robô)
-        min_area_threshold = 0.2 * single_area
+        min_area_threshold = 0.1 * single_area
         filtered_contours = [cnt for cnt in raw_contours if cv2.contourArea(cnt) >= min_area_threshold]
 
         if self.var_d:
@@ -1891,7 +2028,7 @@ class VisionSystem:
         # inimigos e aliados).
         x_m += x1
         y_m += y1
-        min_rc = (0.75 if team_is_enemy else 0.5) * mainColorRadius
+        min_rc = (0.75 if team_is_enemy else 0.35) * mainColorRadius
         if rc < min_rc:
             return None
 

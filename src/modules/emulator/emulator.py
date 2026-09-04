@@ -1226,7 +1226,9 @@ class Emulator:
         self.errorCode = 0
         self.erase_deques_times()
 
+        self.vs.ResetVs()
         print("[EMULATOR] Execução finalizada com sucesso.")
+
         self.app.menu.att_node_id('I020', 'Parado')
         self.app.menu.save_to_json('config')
         self.app.update_control_buttons("Parado")
