@@ -27,7 +27,7 @@ from modules.communication.ui.interface import *
 
 from modules.control.comm.public.state_tx import StatesTransmissor
 from modules.control.comm.public.commands_rx import CommandsReceiver
-from modules.control.comm.protocols import command_pb2 # Importante para tipagem se necessário
+from modules.control.comm.protocols import command_pb2 
 
 import threading
 import queue

@@ -1,4 +1,6 @@
 import tkinter as tk
+
+from numpy import vsplit
 from imports import *
 from PIL import Image, ImageTk, ImageGrab
 
@@ -87,7 +89,17 @@ class Card:
 
             # Atualiza labels
             self.idLabel.config(text=f"{status_text}", bg=color)
-            self.positionLabel.config(text=f"POS: [{x} | {y}] cm\nv:[{v:.1f},{w:.1f}] | r = {r} cm")
+            if v > 0 and v is not None:
+                vs = f"+{v:.1f}"
+            else:
+                vs = " 0.0"
+
+            if w > 0 and w is not None:
+                w = w * 180/np.pi
+                ws = f"+{w:.1f}"
+            else:
+                ws = " 0.0"
+            self.positionLabel.config(text=f"POS: [{x} | {y}] cm\nv:[{vs},{ws}]")
 
             # Exibe imagem, se houver
             if image is not None:
