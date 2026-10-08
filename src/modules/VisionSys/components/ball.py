@@ -35,8 +35,7 @@ class Ball:
         self.lastPosition = self.position.copy()
         self.newPosition = self.position.copy()
         self.velocity = np.array([0.0, 0.0], dtype=float)
-        self.omega = 0.0  # Velocidade angular (não usada, mantida para compatibilidade)
-
+  
         # --- Kalman: estado [x, y, vx, vy] (4D) ---
         self.kalman_initialized = False
         self.kalman_last_time = None
@@ -130,7 +129,7 @@ class Ball:
 
         # --- Velocidade derivada do deslocamento (para fins de medição, mas o Kalman estima) ---
         delta = self.newPosition - self.lastPosition
-        dt = max(timestamp - self.newTimestamp, 1e-3)
+        dt = max(timestamp - self.newTimestamp, 1e-3)*1000 #converte para segundos
         if dt > 0:
             self.velocity = delta / dt  # velocidade bruta (não filtrada)
 
@@ -155,6 +154,13 @@ class Ball:
         self.lastPosition = self.position.copy()
         self.position = np.array([x, y], dtype=float)
         self.newPosition = self.position.copy()
+
+        # --- Velocidade derivada do deslocamento (para fins de medição, mas o Kalman estima) ---
+        delta = self.newPosition - self.lastPosition
+        dt = max(timestamp - self.newTimestamp, 1e-3)*1000 #converte para segundos
+        if dt > 0:
+            self.velocity = delta / dt  # velocidade bruta (não filtrada)
+
 
         if theta is not None:
             self.theta = theta
@@ -343,7 +349,6 @@ class Ball:
         self.direction[:] = 0
         self.velocity[:] = 0
         self.theta = 0
-        self.omega = 0
         self.status = False
         self.radius = 0
 

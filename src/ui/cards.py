@@ -66,7 +66,7 @@ class Card:
     
         self.canvas.create_image(x,y, anchor=NW, image=self.image)
 
-    def set_content(self, id, status, position, radius, image):
+    def set_content(self, id, status, position, radius, image, v = 0, w = 0):
         try:
             # Garante que posição e raio sejam válidos
             if position is not None and len(position) >= 2:
@@ -87,7 +87,7 @@ class Card:
 
             # Atualiza labels
             self.idLabel.config(text=f"{status_text}", bg=color)
-            self.positionLabel.config(text=f"POS: [{x} | {y}] cm\nr = {r} cm")
+            self.positionLabel.config(text=f"POS: [{x} | {y}] cm\nv:[{v:.1f},{w:.1f}] | r = {r} cm")
 
             # Exibe imagem, se houver
             if image is not None:

@@ -18,7 +18,9 @@ class Robot:
 
         # Direção & Ângulo
         self._direction = np.array([1.0, 0.0])
-        self._theta = 0.0
+        self._theta = 0.0   
+        self._last_theta = 0.0
+        self._new_theta = 0.0
 
         # Geometria
         self.radius = float(r)
@@ -52,7 +54,12 @@ class Robot:
         self.newTimestamp = 0
         self.dT = 0.0
 
-        # EKF
+        # Velocidad estimada do robô
+        self.velocity = np.array([0.0,0.0])
+        self.v = 0.0
+        self.w = 0.0 
+
+        # EKF  
         self.kalman_initialized = False
         self.kalman_last_time = None
         self._init_kalman()
@@ -73,7 +80,7 @@ class Robot:
         self.kalman_Q = np.diag([0.05, 0.05, 0.01, 10.0, 5.0])
 
         # Ruído de Medição da Visão (R): Mede [x, y, theta]
-        self.kalman_R = np.diag([1.5, 1.5, 0.03])
+        self.kalman_R = np.diag([1.5, 1.5, 0.03,0.03,0.03])
 
         self.kalman_initialized = False
         self.kalman_last_time = None
@@ -127,6 +134,7 @@ class Robot:
             return np.array([0.0, 0.0])
         return self.kalman_state[3:5, 0]
 
+    
     @property
     def omega_filtered(self):
         """ Retorna a velocidade angular filtrada (rad/s) """
@@ -145,7 +153,7 @@ class Robot:
     # --------------------------
     # Atualização de Posição
     # --------------------------
-    def setPosition(self, x, y, direction, image, time, wheel_velocities=None):
+    def setPosition(self, x, y, direction, image, time):
         self.lastTimestamp = self.newTimestamp
         self.newTimestamp = time
         self.dT = self.newTimestamp - self.lastTimestamp if self.lastTimestamp != 0 else 0.0
@@ -155,7 +163,29 @@ class Robot:
         self.position = np.array([x, y], dtype=float)
         self.newPosition = self.position.copy()
 
+        # --- Velocidade derivada do deslocamento (para fins de medição, mas o Kalman estima) ---
+        delta = self.newPosition - self.lastPosition
+        dt = max(time - self.newTimestamp, 1e-3)*1000 #converte para segundos
+        if dt > 0:
+            self.velocity = delta / dt  # velocidade bruta (não filtrada)
+
+        # Convertendo velocidade medida para velocidades angulares e lineares.
+        self.v = np.linalg.norm(self.velocity)
+        
+        # outras variáveis
+        self.lastDirection = self.direction #Salvo direção anterior
         self.direction = direction 
+        self.newDirection = self.direction 
+        if dt > 0:
+            ang_l = np.arctan2(self.lastDirection[1],self.lastDirection[0])
+            ang_n = np.arctan2(self.newDirection[1],self.newDirection[0])
+
+            delta_Theta = ang_n - ang_l 
+
+            delta_Theta = np.arctan2(np.sin(delta_Theta), np.cos(delta_Theta))
+
+            self.w = delta_Theta/dt #velocidade angular em rad/s
+
         self.image = image
         if image is not None:
             self.viewRect.setDimension(image.shape[1])
@@ -166,9 +196,9 @@ class Robot:
         self.updateBbox()
 
         # Atualiza Kalman com a MEDIÇÃO REAL recebida
-        self.update_kalman([x, y, self.theta], time)
+        self.update_kalman([x, y, self.theta,self.v,self.w], time)
 
-    def updatePosition(self, x, y, direction, image, time, wheel_velocities=None):
+    def updatePosition(self, x, y, direction, image, time):
         self.setPosition(x, y, direction, image, time)
 
     def setRadius(self, r):
@@ -202,12 +232,12 @@ class Robot:
         return A
 
     def update_kalman(self, z_list, timestamp):
-        x_m, y_m, theta_m = z_list
+        x_m, y_m, theta_m, v_m, w_m = z_list
         theta_m = self._normalize_angle(theta_m)
-        z = np.array([[x_m], [y_m], [theta_m]], dtype=float)
+        z = np.array([[x_m], [y_m], [theta_m],[v_m],[w_m]], dtype=float)
 
         if not self.kalman_initialized:
-            self.kalman_state[:3, 0] = [x_m, y_m, theta_m]
+            self.kalman_state[:5, 0] = [x_m, y_m, theta_m,v_m,w_m]
             self.kalman_initialized = True
             self.kalman_last_time = timestamp
             return
@@ -220,11 +250,13 @@ class Robot:
         self.kalman_state = self._non_linear_motion_model(self.kalman_state, dt)
         self.kalman_P = A @ self.kalman_P @ A.T + self.kalman_Q
 
-        # 2. CORREÇÃO
+        # 2. CORREÇÃO (Agora ele considera as velocidades vx e vy computadas.)
         H = np.array([
             [1, 0, 0, 0, 0],
             [0, 1, 0, 0, 0],
-            [0, 0, 1, 0, 0]
+            [0, 0, 1, 0, 0],
+            [0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 1]
         ], dtype=float)
 
         pred = H @ self.kalman_state
@@ -353,10 +385,15 @@ class Robot:
         self.position = np.array([0.0, 0.0])
         self.lastPosition = self.position.copy()
         self.newPosition = self.position.copy()
+        self.lastDirection = np.array([1.0, 0.0])
+        self.newDirection = np.array([1.0, 0.0])
         self.direction = np.array([1.0, 0.0])
         self.theta = 0.0
         self.detected = False
         self.possessionBall = False
+        self.velocity = 0.0
+        self.v = 0.0
+        self.w = 0.0 
         self.dT = 0.0
         self.lastTimestamp = 0
         self.newTimestamp = 0

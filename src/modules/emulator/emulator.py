@@ -1381,15 +1381,17 @@ class Emulator:
     def setContentRobots(self):
         for i in range(3):
             if self.allies[i] is not None:
-                self.cards[i].set_content(self.allies[i].id, self.allies[i].detected, self.allies[i].position, self.allies[i].radius, self.allies[i].image)
+                v_ai, w_ai= self.allies[i].velocity_filtered
+                self.cards[i].set_content(self.allies[i].id, self.allies[i].detected, self.allies[i].position, self.allies[i].radius, self.allies[i].image, v = v_ai, w= w_ai)
             else:
-                self.cards[i].set_content("#0", False, ["0.0", "0.0"], "0.0", None)
+                self.cards[i].set_content("#0", False, ["0.0", "0.0"], "0.0", image=None, v=0.0, w=0.0)
                 
         for i in range(3):
             if self.enemies[i] is not None:
-                self.cards[i+3].set_content(self.enemies[i].id, self.enemies[i].detected, self.enemies[i].position, self.enemies[i].radius, self.enemies[i].image)
+                v_ai, w_ai= self.enemies[i].velocity_filtered
+                self.cards[i+3].set_content(self.enemies[i].id, self.enemies[i].detected, self.enemies[i].position, self.enemies[i].radius, self.enemies[i].image,  v = v_ai, w= w_ai)
             else:
-                self.cards[i+3].set_content("#0", False, ["0.0", "0.0"], "0.0", None)
+                self.cards[i+3].set_content("#0", False, ["0.0", "0.0"], "0.0", image=None, v=0.0, w=0.0)
 
     def __enter__(self):
         return self
