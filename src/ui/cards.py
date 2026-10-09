@@ -99,7 +99,7 @@ class Card:
                 ws = f"+{w:.1f}"
             else:
                 ws = " 0.0"
-            self.positionLabel.config(text=f"POS: [{x} | {y}] cm\nv:[{vs},{ws}]")
+            self.positionLabel.config(text=f"POS: [{x} | {y}] cm\n[v,w]:[{vs},{ws}]")
 
             # Exibe imagem, se houver
             if image is not None:
