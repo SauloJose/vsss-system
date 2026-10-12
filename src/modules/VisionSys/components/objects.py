@@ -13,12 +13,10 @@
 '''
 import numpy as np
 import time
-from ui.viewer import MyViewer
 import threading
 import queue
 import tkinter 
 from collections import deque, defaultdict
-from ui.settingsMenu import *
 
 from tkinter import *
 from tkinter import ttk

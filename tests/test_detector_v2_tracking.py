@@ -22,8 +22,9 @@ def test_hsv_sampling_uses_small_median_window():
     hsv = np.full((5, 5, 3), [0, 0, 0], dtype=np.uint8)
     hsv[1:4, 1:4] = [100, 200, 200]
 
-    sampled = vs._SampleHsvWindow9(hsv, 2, 2, pad=1)
-    measured = vs.GetHsvMean(hsv, 2, 2)
+    padded_hsv = np.pad(hsv, ((1, 1), (1, 1), (0, 0)), mode='reflect')
+    sampled = vs._SampleHsvWindow9(padded_hsv, 2, 2, pad=1)
+    measured = vs.GetHsvMean(hsv, 2, 2, kernel=1)
 
     assert np.array_equal(sampled, [100, 200, 200])
     assert np.array_equal(measured, [100, 200, 200])

@@ -1,4 +1,5 @@
 from imports import *
+from PIL import Image as PILImage
 
 #Classe de player para o aplicativo
 class MyViewer:
@@ -30,7 +31,7 @@ class MyViewer:
     
     def show(self, image):
         cv2Img = cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
-        pilImage = Image.fromarray(cv2Img)
+        pilImage = PILImage.fromarray(cv2Img)
         
         # Obter as dimensões atuais da imagem
         width, height = pilImage.size
@@ -48,7 +49,12 @@ class MyViewer:
         
         # Redimensionar a imagem
         #resized = pilImage.resize((new_width, new_height), Image.ANTIALIAS)
-        resized = pilImage.resize((new_width, new_height), Image.LANCZOS)
+        resized = pilImage
+        if pilImage.size != (new_width, new_height):
+            resized = pilImage.resize(
+                (new_width, new_height),
+                PILImage.Resampling.LANCZOS,
+            )
         self.image = ImageTk.PhotoImage(image=resized)
         
         # Calcular as coordenadas para centralizar a imagem
@@ -123,7 +129,7 @@ class WindowsViewer:
         pathImg = 'src/data/images/dark_screen.png'
         imgagemPadrao = cv2.imread(pathImg)
         cv2Img = cv2.cvtColor(imgagemPadrao, cv2.COLOR_BGR2RGBA)
-        pilImage = Image.fromarray(cv2Img)
+        pilImage = PILImage.fromarray(cv2Img)
         self.img = ImageTk.PhotoImage(image=pilImage)
         self.listaDeImagens = [self.img, self.img, self.img, self.img, self.img, self.img]
         self.x = 100
@@ -134,7 +140,7 @@ class WindowsViewer:
 
                 if(image[i] is not None):
                     cv2Img = cv2.cvtColor(image[i], cv2.COLOR_BGR2RGBA)
-                    pilImage = Image.fromarray(cv2Img)
+                    pilImage = PILImage.fromarray(cv2Img)
                     
                     # Obter as dimensões atuais da imagem
                     width, height = pilImage.size
@@ -155,7 +161,12 @@ class WindowsViewer:
                     
                     # Redimensionar a imagem
                     #resized = pilImage.resize((new_width, new_height), Image.ANTIALIAS)
-                    resized = pilImage.resize((new_width, new_height), Image.LANCZOS)
+                    resized = pilImage
+                    if pilImage.size != (new_width, new_height):
+                        resized = pilImage.resize(
+                            (new_width, new_height),
+                            PILImage.Resampling.LANCZOS,
+                        )
                     self.image = ImageTk.PhotoImage(image=resized)
                     self.listaDeImagens[i] = self.image
 

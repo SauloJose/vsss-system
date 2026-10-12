@@ -1,5 +1,3 @@
-import os
-import sys
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -7,13 +5,8 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-    sys.path.insert(0, os.path.join(ROOT, 'src'))
-
-
-VIDEO_DIR = Path(ROOT) / 'src' / 'data' / 'videos'
+ROOT = Path(__file__).resolve().parents[1]
+VIDEO_DIR = ROOT / 'src' / 'data' / 'videos'
 VIDEO_FILES = sorted(VIDEO_DIR.glob('*.mp4'))
 
 
@@ -86,23 +79,21 @@ def test_commands_receiver_parses_message():
     from modules.control.comm.public.commands_rx import CommandsReceiver
     from modules.control.comm.protocols import command_pb2
 
-    class DummyReceiver:
-        def __init__(self, ip='224.0.0.1', port=10003):
-            self.ip = ip
-            self.port = port
+    payload = command_pb2.Commands()
+    cmd = payload.robot_commands.add()
+    cmd.id = 1
+    cmd.yellowteam = False
+    cmd.wheel_left = 3.0
+    cmd.wheel_right = 4.0
 
-        def receive(self):
-            pb = command_pb2.Commands()
-            cmd = pb.robot_commands.add()
-            cmd.id = 1
-            cmd.yellowteam = False
-            cmd.wheel_left = 3.0
-            cmd.wheel_right = 4.0
-            return pb.SerializeToString()
-
-    with patch('modules.control.comm.public.commands_rx.Receiver', DummyReceiver):
-        receiver = CommandsReceiver(ip='127.0.0.1', port=10003)
-        team_cmd = receiver.receive_and_convert()
+    with patch(
+        'modules.control.comm.public.commands_rx.Receiver.__init__',
+        return_value=None,
+    ), patch(
+        'modules.control.comm.public.commands_rx.Receiver.receive',
+        return_value=payload.SerializeToString(),
+    ):
+        team_cmd = CommandsReceiver(ip='127.0.0.1', port=10003).receive_and_convert()
 
     assert team_cmd is not None
     assert team_cmd.commands[1].left_speed == 3.0
@@ -121,9 +112,15 @@ def test_emulator_initialization_smoke(monkeypatch):
         debugTeam = types.SimpleNamespace()
         result = types.SimpleNamespace()
         virtualVision = types.SimpleNamespace()
-        cards = []
+        cards = [
+            types.SimpleNamespace(set_content=lambda *args, **kwargs: None)
+            for _ in range(6)
+        ]
         infosEmulator = types.SimpleNamespace()
         IdFrame = 2
+        system = 'test'
+        release = 'test'
+        version = 'test'
         btn_run = types.SimpleNamespace()
         btn_pause = types.SimpleNamespace()
         btn_stop = types.SimpleNamespace()

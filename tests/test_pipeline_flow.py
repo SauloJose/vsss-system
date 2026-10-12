@@ -1,15 +1,10 @@
-import os
 import sys
 import types
 
 import numpy as np
 import pytest
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-    sys.path.insert(0, os.path.join(ROOT, 'src'))
-
+from modules.VisionSys.components.objects import MODE_IMAGE, MODE_VIDEO_CAM
 
 @pytest.fixture
 def vision_system(monkeypatch):
@@ -42,7 +37,7 @@ def test_processimg_uses_proc_path_for_image_mode(vision_system):
         calls.append(('proc', args[0].shape))
         return img.copy()
 
-    vision_system.emulatorMode = 'image'
+    vision_system.emulatorMode = MODE_IMAGE
     vision_system.Proc = fake_proc
     vision_system.DrawAllRobots = lambda: None
 
@@ -60,7 +55,7 @@ def test_pipeline_calls_filtered_detection_in_video_mode(monkeypatch, vision_sys
         calls.append('filtered')
         vision_system.frameResult = img.copy()
 
-    vision_system.emulatorMode = 'video'
+    vision_system.emulatorMode = MODE_VIDEO_CAM
     vision_system.fieldDetectedFlag = True
     vision_system._count = 12000
     vision_system.lastMajorTime = 0

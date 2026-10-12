@@ -1,15 +1,8 @@
-import os
 import sys
 import types
 from unittest.mock import patch
 
 import pytest
-
-
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-    sys.path.insert(0, os.path.join(ROOT, 'src'))
 
 
 class DummyRoot:
